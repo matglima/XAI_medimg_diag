@@ -1,0 +1,27 @@
+# Data files
+data/*
+*.csv
+*.json
+
+# Model files
+*.pth
+*.pt
+
+# Images
+*.png
+*.jpg
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and IDE files
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+
