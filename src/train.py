@@ -186,7 +186,7 @@ class Trainer:
         if val_f1 > self.best_f1:
             self.best_f1 = val_f1
             self.early_stop_counter = 0
-            torch.save(self.model.state_dict(), 'best_model.pth')
+            torch.save(self.model.state_dict(), self.args.model_name + '_best_model.pth')
         else:
             self.early_stop_counter += 1
             
