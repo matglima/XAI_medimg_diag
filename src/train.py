@@ -222,8 +222,8 @@ class Trainer:
             val_loss, val_preds, val_targets = self._validate(val_loader)
 
             # Calculate metrics with zero_division parameter
-            train_f1 = f1_score(train_targets, np.round(train_preds), zero_division=1.0)
-            val_f1 = f1_score(val_targets, np.round(val_preds), zero_division=1.0)
+            train_f1 = f1_score(train_targets, np.round(train_preds), average='macro', zero_division=1.0)
+            val_f1 = f1_score(val_targets, np.round(val_preds), average='macro', zero_division=1.0)
             
             # Only calculate AUC if there are both classes present
             if len(np.unique(val_targets)) > 1:
