@@ -45,6 +45,7 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.best_f1 = 0
         self.early_stop_counter = 0
+        self.model_save_name = f"{args.model_name}_{args.target_label}_best_model.pth"  # Added
         
         # Load data
         self.labels_df = self._load_labels()
@@ -59,6 +60,13 @@ class Trainer:
             model_size=args.model_size,
             pretrained=args.pretrained
         ).to(self.device)
+        
+        # Load checkpoint if resuming
+        if args.resume_from:  # Added
+            self.model.load_state_dict(
+                torch.load(args.resume_from, map_location=self.device)
+            )
+            logger.info(f"Resumed model from checkpoint: {args.resume_from}")
         
         # Add dropout if specified
         if args.dropout > 0:
@@ -186,7 +194,7 @@ class Trainer:
         if val_f1 > self.best_f1:
             self.best_f1 = val_f1
             self.early_stop_counter = 0
-            torch.save(self.model.state_dict(), self.args.model_name + '_best_model.pth')
+            torch.save(self.model.state_dict(), self.model_save_name)  # Modified
         else:
             self.early_stop_counter += 1
             
@@ -256,7 +264,7 @@ class Trainer:
         logger.info("\nTraining completed!")
         logger.info(f"Best validation F1: {self.best_f1:.4f}")
         logger.info("Loading best model weights...")
-        self.model.load_state_dict(torch.load('best_model.pth'))
+        self.model.load_state_dict(torch.load(self.model_save_name, map_location=self.device))  # Modified
         return self.best_f1
 
 def objective(trial, args):
@@ -296,6 +304,8 @@ if __name__ == '__main__':
     parser.add_argument('--test_size', type=float, default=0.2)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--early_stop_patience', type=int, default=5)
+    parser.add_argument('--resume_from', type=str, default=None,  # Added
+                       help='Path to a checkpoint file to resume training from')
     
     # Optuna parameters
     parser.add_argument('--optuna_trials', type=int, default=0,
