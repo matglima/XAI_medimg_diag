@@ -69,8 +69,8 @@ class ModelWrapper(nn.Module):
             in_features = self.model.classifier[-1].in_features
             self.model.classifier[-1] = nn.Linear(in_features, 1)
         elif hasattr(self.model, 'heads'):  # Swin
-            in_features = self.model.head.in_features
-            self.model.head = nn.Linear(in_features, 1)
+            in_features = self.model.hidden_dim
+            self.model.heads = nn.Linear(in_features, 1)
         else:  # ViT
             in_features = self.model.heads.head.in_features
             self.model.heads.head = nn.Linear(in_features, 1)
