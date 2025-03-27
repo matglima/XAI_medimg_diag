@@ -68,12 +68,12 @@ class ModelWrapper(nn.Module):
         elif hasattr(self.model, 'classifier'):  # EfficientNet
             in_features = self.model.classifier[-1].in_features
             self.model.classifier[-1] = nn.Linear(in_features, 1)
-        elif hasattr(self.model, 'heads'):  # Swin
+        elif hasattr(self.model, 'heads'):  # ViT
             in_features = self.model.hidden_dim
             self.model.heads = nn.Linear(in_features, 1)
-        else:  # ViT
-            in_features = self.model.heads.head.in_features
-            self.model.heads.head = nn.Linear(in_features, 1)
+        else:  # Swin
+            in_features = self.model.head.in_features
+            self.model.head = nn.Linear(in_features, 1)
     
     def _get_transforms(self):
         """Get model-specific preprocessing transforms"""
