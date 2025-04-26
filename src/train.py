@@ -45,7 +45,8 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.best_f1 = 0
         self.early_stop_counter = 0
-        self.model_save_name = f"{args.model_name}_{args.target_label}_best_model.pth"  # Added
+        self.model_save_name = f"{args.model_name}_{args.target_label}_best_model.pth"
+        self.use_print = args.use_print
         
         # Load data
         self.labels_df = self._load_labels()
@@ -62,11 +63,11 @@ class Trainer:
         ).to(self.device)
         
         # Load checkpoint if resuming
-        if args.resume_from:  # Added
+        if args.resume_from:
             self.model.load_state_dict(
                 torch.load(args.resume_from, map_location=self.device)
             )
-            logger.info(f"Resumed model from checkpoint: {args.resume_from}")
+            self._log(f"Resumed model from checkpoint: {args.resume_from}")
         
         # Add dropout if specified
         if args.dropout > 0:
@@ -81,6 +82,13 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, 'max', patience=2
         )
+
+    def _log(self, message):
+        """Handle output based on user preference"""
+        if self.use_print:
+            print(message)
+        else:
+            logger.info(message)
 
     def _load_labels(self):
         labels_df = pd.read_csv(self.args.labels_path)
@@ -99,7 +107,6 @@ class Trainer:
                 nn.Dropout(p),
                 self.model.model.classifier
             )
-        # Add similar modifications for other architectures
 
     def _create_dataloaders(self, batch_size):
         transform = self.model.transform
@@ -113,6 +120,11 @@ class Trainer:
             self.args.target_label, transform['val'],
             self.splits['val']
         )
+        test_dataset = RetinaDataset(
+            self.labels_df, self.args.image_dir,
+            self.args.target_label, transform['val'],
+            self.splits['test']
+        )
         
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
@@ -122,14 +134,17 @@ class Trainer:
             val_dataset, batch_size=batch_size,
             shuffle=False, num_workers=4, pin_memory=True
         )
-        return train_loader, val_loader
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size,
+            shuffle=False, num_workers=4, pin_memory=True
+        )
+        return train_loader, val_loader, test_loader
 
     def _calculate_class_weights(self, targets, preds):
         """Dynamic class weighting based on F1 score"""
         targets_np = targets.detach().cpu().numpy()
         preds_np = torch.sigmoid(preds).detach().cpu().numpy()
         
-        # Add zero_division parameter to handle the warning
         pos_weight = (1 - f1_score(targets_np, np.round(preds_np), zero_division=0))
         neg_weight = 1 - pos_weight
         return torch.tensor([neg_weight, pos_weight], device=self.device)
@@ -147,7 +162,6 @@ class Trainer:
             self.optimizer.zero_grad()
             outputs = self.model(images).squeeze(1)
             
-            # Calculate dynamic class weights
             class_weights = self._calculate_class_weights(targets, outputs)
             loss = focal_loss(outputs, targets) * class_weights[1]
             
@@ -194,7 +208,7 @@ class Trainer:
         if val_f1 > self.best_f1:
             self.best_f1 = val_f1
             self.early_stop_counter = 0
-            torch.save(self.model.state_dict(), self.model_save_name)  # Modified
+            torch.save(self.model.state_dict(), self.model_save_name)
         else:
             self.early_stop_counter += 1
             
@@ -203,40 +217,38 @@ class Trainer:
         return False
 
     def train(self):
-        logger.info(f"Starting training with device: {self.device}")
-        logger.info(f"Model: {self.args.model_name}, Size: {self.args.model_size}")
-        logger.info(f"Learning rate: {self.args.lr}, Batch size: {self.args.batch_size}")
+        self._log(f"Starting training with device: {self.device}")
+        self._log(f"Model: {self.args.model_name}, Size: {self.args.model_size}")
+        self._log(f"Learning rate: {self.args.lr}, Batch size: {self.args.batch_size}")
         
         focal_loss = FocalLoss(alpha=self.args.alpha, gamma=self.args.gamma)
-        train_loader, val_loader = self._create_dataloaders(self.args.batch_size)
+        train_loader, val_loader, test_loader = self._create_dataloaders(self.args.batch_size)
         
-        logger.info(f"Train dataset size: {len(train_loader.dataset)}")
-        logger.info(f"Validation dataset size: {len(val_loader.dataset)}")
+        self._log(f"Train dataset size: {len(train_loader.dataset)}")
+        self._log(f"Validation dataset size: {len(val_loader.dataset)}")
+        self._log(f"Test dataset size: {len(test_loader.dataset)}")
 
         for epoch in range(self.args.epochs):
-            logger.info(f"\nEpoch {epoch+1}/{self.args.epochs}")
-            logger.info("-" * 50)
+            self._log(f"\nEpoch {epoch+1}/{self.args.epochs}")
+            self._log("-" * 50)
             
-            # Log current learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
-            logger.info(f"Current learning rate: {current_lr:.2e}")
+            self._log(f"Current learning rate: {current_lr:.2e}")
             
             # Training phase
-            logger.info("Training phase:")
+            self._log("Training phase:")
             train_loss, train_preds, train_targets = self._train_epoch(train_loader, focal_loss)
             
             # Validation phase
-            logger.info("Validation phase:")
+            self._log("Validation phase:")
             val_loss, val_preds, val_targets = self._validate(val_loader)
 
-            # Calculate metrics with zero_division parameter
             train_f1 = f1_score(train_targets, np.round(train_preds), average='macro', zero_division=1.0)
             val_f1 = f1_score(val_targets, np.round(val_preds), average='macro', zero_division=1.0)
             
-            # Only calculate AUC if there are both classes present
             if len(np.unique(val_targets)) > 1:
                 val_auc = roc_auc_score(val_targets, val_preds)
-                logger.info(
+                self._log(
                     f"Results:\n"
                     f"  Train Loss: {train_loss:.4f}\n"
                     f"  Val Loss: {val_loss:.4f}\n"
@@ -245,35 +257,51 @@ class Trainer:
                     f"  Val AUC: {val_auc:.4f}"
                 )
             else:
-                logger.info(
+                self._log(
                     f"Results:\n"
                     f"  Train Loss: {train_loss:.4f}\n"
                     f"  Val Loss: {val_loss:.4f}\n"
                     f"  Train F1: {train_f1:.4f}\n"
                     f"  Val F1: {val_f1:.4f}\n"
-                    f"  Val AUC: N/A (requires both classes to be present)"
+                    f"  Val AUC: N/A (requires both classes)"
                 )
 
             self.scheduler.step(val_f1)
 
             if self._early_stopping(val_f1):
-                logger.info("\nEarly stopping triggered! Best validation F1: {:.4f}".format(self.best_f1))
+                self._log("\nEarly stopping triggered! Best validation F1: {:.4f}".format(self.best_f1))
                 break
 
-        # Final summary
-        logger.info("\nTraining completed!")
-        logger.info(f"Best validation F1: {self.best_f1:.4f}")
-        logger.info("Loading best model weights...")
-        self.model.load_state_dict(torch.load(self.model_save_name, map_location=self.device))  # Modified
+        # Final evaluation
+        self._log("\nTraining completed!")
+        self._log(f"Best validation F1: {self.best_f1:.4f}")
+        self._log("Loading best model weights for test evaluation...")
+        self.model.load_state_dict(torch.load(self.model_save_name, map_location=self.device))
+        
+        self._log("\nEvaluating on test set...")
+        test_loss, test_preds, test_targets = self._validate(test_loader)
+        test_f1 = f1_score(test_targets, np.round(test_preds), average='macro', zero_division=1.0)
+        if len(np.unique(test_targets)) > 1:
+            test_auc = roc_auc_score(test_targets, test_preds)
+        else:
+            test_auc = None
+        
+        self._log(f"Test Results:")
+        self._log(f"  Test Loss: {test_loss:.4f}")
+        self._log(f"  Test F1: {test_f1:.4f}")
+        if test_auc is not None:
+            self._log(f"  Test AUC: {test_auc:.4f}")
+        else:
+            self._log("  Test AUC: N/A (requires both classes)")
+        
         return self.best_f1
 
 def objective(trial, args):
-    # Hyperparameter suggestions
     args.lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
     args.dropout = trial.suggest_float('dropout', 0.0, 0.5)
     args.batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-    args.alpha = trial.suggest_float('alpha', 0.1, 0.9)  # Focal loss alpha
-    args.gamma = trial.suggest_float('gamma', 0.5, 3.0)  # Focal loss gamma
+    args.alpha = trial.suggest_float('alpha', 0.1, 0.9)
+    args.gamma = trial.suggest_float('gamma', 0.5, 3.0)
     
     trainer = Trainer(args)
     val_f1 = trainer.train()
@@ -296,6 +324,7 @@ if __name__ == '__main__':
                        help='Alpha parameter for focal loss')
     parser.add_argument('--gamma', type=float, default=2.0,
                        help='Gamma parameter for focal loss')
+    
     # Training parameters
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -304,8 +333,12 @@ if __name__ == '__main__':
     parser.add_argument('--test_size', type=float, default=0.2)
     parser.add_argument('--val_size', type=float, default=0.1)
     parser.add_argument('--early_stop_patience', type=int, default=5)
-    parser.add_argument('--resume_from', type=str, default=None,  # Added
-                       help='Path to a checkpoint file to resume training from')
+    parser.add_argument('--resume_from', type=str, default=None,
+                       help='Path to checkpoint to resume training')
+    
+    # Output control
+    parser.add_argument('--use_print', action='store_true',
+                       help='Use print statements for metrics instead of logging')
     
     # Optuna parameters
     parser.add_argument('--optuna_trials', type=int, default=0,
