@@ -13,6 +13,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from sklearn.model_selection import train_test_split
+import numpy as np # <-- IMPORT NUMPY
 
 # --- Define Global Transforms ---
 
@@ -53,8 +54,11 @@ class RetinaDataset(Dataset):
         if image_ids is not None:
             self.dataframe = self.dataframe[self.dataframe['image_id'].isin(image_ids)]
         
-        # Verify we have valid labels
-        self.labels = self.dataframe[target_label].values
+        # --- START FIX ---
+        # Force the column to be a numeric type (float32) BEFORE converting to numpy
+        # This prevents the "numpy.object_" error.
+        self.labels = self.dataframe[target_label].astype(np.float32).values
+        # --- END FIX ---
 
     def __len__(self):
         return len(self.dataframe)
@@ -74,7 +78,7 @@ class RetinaDataset(Dataset):
                 image_path = f"{image_path}.jpg"
 
         image = Image.open(image_path).convert('RGB')
-        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        label = torch.tensor(self.labels[idx], dtype=torch.float32) # This will now work
         
         if self.transform:
             image = self.transform(image)
@@ -101,7 +105,10 @@ class MultiLabelRetinaDataset(Dataset):
         if image_ids is not None:
             self.dataframe = self.dataframe[self.dataframe['image_id'].isin(image_ids)]
 
-        self.labels = self.dataframe[self.pathology_columns].values
+        # --- START FIX ---
+        # Force all pathology columns to be float32 BEFORE converting to numpy
+        self.labels = self.dataframe[self.pathology_columns].astype(np.float32).values
+        # --- END FIX ---
 
     def __len__(self):
         return len(self.dataframe)
@@ -122,7 +129,7 @@ class MultiLabelRetinaDataset(Dataset):
 
         image = Image.open(image_path).convert('RGB')
         # The label is now a vector of 0s and 1s
-        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        label = torch.tensor(self.labels[idx], dtype=torch.float32) # This will now work
 
         if self.transform:
             image = self.transform(image)
@@ -133,10 +140,8 @@ class MultiLabelRetinaDataset(Dataset):
 
 def get_stratified_splits(dataframe, target_label, test_size=0.2, val_size=0.1, random_state=42):
     """
-    Creates stratified splits at image level (not patient level)
-    Returns: {'train': [], 'val': [], 'test': []} image_ids
+    Creates stratified splits for BINARY classification.
     """
-    # First split into train+val and test
     train_val_ids, test_ids = train_test_split(
         dataframe['image_id'],
         test_size=test_size,
@@ -144,7 +149,6 @@ def get_stratified_splits(dataframe, target_label, test_size=0.2, val_size=0.1, 
         random_state=random_state
     )
     
-    # Then split train_val into train and val
     train_ids, val_ids = train_test_split(
         train_val_ids,
         test_size=val_size/(1-test_size),  # Adjust for relative split
