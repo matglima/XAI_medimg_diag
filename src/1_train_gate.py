@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from tqdm import tqdm
 import os
+import warnings
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from models import create_model, get_optimizer
@@ -52,8 +53,8 @@ def run_epoch(model, loader, criterion, optimizer, device, is_training):
 
     progress_bar = tqdm(loader, desc="Training" if is_training else "Validation")
     for images, targets in progress_bar:
-        images = images.to(device)
-        targets = targets.to(device)
+        images = images.to(device, non_blocking=True) # Use non_blocking for pin_memory
+        targets = targets.to(device, non_blocking=True)
 
         with torch.set_grad_enabled(is_training):
             outputs = model(images)
@@ -80,8 +81,27 @@ def get_metrics(targets, preds):
     # Calculate metrics for multi-label classification
     preds_rounded = np.round(preds)
     
+    # --- START FIX: Robust AUC Calculation ---
+    auc_scores = []
+    num_classes = targets.shape[1]
+    
+    # Suppress warnings for classes with only one label
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for i in range(num_classes):
+            try:
+                class_auc = roc_auc_score(targets[:, i], preds[:, i])
+                auc_scores.append(class_auc)
+            except ValueError:
+                # This happens if (e.g.) all labels are 0 for this class
+                # We'll append 0.5 as a neutral score, or you could append np.nan
+                auc_scores.append(0.5) 
+                
+    # Calculate macro average from the list of scores
+    auc_macro = np.mean(auc_scores)
+    # --- END FIX ---
+
     f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
-    auc_macro = roc_auc_score(targets, preds, average='macro')
     acc = accuracy_score(targets, preds_rounded) # This is subset accuracy (very strict)
     
     return {'f1_macro': f1_macro, 'auc_macro': auc_macro, 'accuracy': acc}
@@ -110,11 +130,11 @@ def main(args):
     
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, 
-        num_workers=args.num_workers, pin_memory=True
+        num_workers=args.num_workers, pin_memory=True # <-- ADDED pin_memory
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False, 
-        num_workers=args.num_workers, pin_memory=True
+        num_workers=args.num_workers, pin_memory=True # <-- ADDED pin_memory
     )
     
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
