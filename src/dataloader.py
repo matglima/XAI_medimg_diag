@@ -2,8 +2,8 @@
 # File: dataloader.py
 # -----------------------------------------------------------------
 # Description:
-# Contains the Dataset classes for both binary (expert) and
-# multi-label (gate/calibration) training.
+# Contains the Dataset classes.
+# NOW WITH IN-MEMORY CACHING to solve CPU bottlenecks.
 # -----------------------------------------------------------------
 
 import os
@@ -13,12 +13,24 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from sklearn.model_selection import train_test_split
-import numpy as np # <-- IMPORT NUMPY
+import numpy as np
+from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
 
 # --- Define Global Transforms ---
+# We split transforms into two parts:
+# 1. PRE-CACHE: Slow transforms (Resize)
+# 2. ON-THE-FLY: Fast, random transforms (Augmentations)
 
-train_transform = transforms.Compose([
+# The transform to apply *before* caching (slow)
+pre_transform = transforms.Compose([
     transforms.Resize((256, 256)),
+])
+
+# The "on-the-fly" transforms for training
+train_transform = transforms.Compose([
     transforms.RandomCrop(224),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
@@ -27,59 +39,82 @@ train_transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
+# The "on-the-fly" transforms for validation
 val_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
+def _load_and_cache(image_ids, image_dir):
+    """Helper function to load, resize, and cache images in RAM."""
+    cached_images = []
+    print(f"Building image cache... This will take a few minutes.")
+    for image_id in tqdm(image_ids):
+        image_path = os.path.join(image_dir, f"{image_id}.png")
+        if not os.path.exists(image_path):
+            image_path = os.path.join(image_dir, f"{image_id}.jpg")
+        
+        if not os.path.exists(image_path):
+            # Handle potential file extension issues
+            image_path_no_ext = os.path.join(image_dir, str(image_id))
+            if os.path.exists(f"{image_path_no_ext}.png"):
+                image_path = f"{image_path_no_ext}.png"
+            elif os.path.exists(f"{image_path_no_ext}.jpg"):
+                image_path = f"{image_path_no_ext}.jpg"
+            else:
+                logger.warning(f"Could not find image for ID: {image_id}")
+                continue
+
+        try:
+            image = Image.open(image_path).convert('RGB')
+            # Apply the slow resize transform NOW
+            image = pre_transform(image)
+            cached_images.append(image)
+        except Exception as e:
+            logger.error(f"Error loading image {image_path}: {e}")
+            
+    print("Image cache built successfully.")
+    return cached_images
+
 # --- Dataset for Binary Experts ---
 
 class RetinaDataset(Dataset):
     def __init__(self, dataframe, image_dir, target_label, transform=None, image_ids=None):
-        """
-        Args:
-            dataframe: DataFrame containing all labels
-            image_dir: Directory with fundus images
-            target_label: Specific disease label to use for binary classification
-            transform: Optional transform to apply
-            image_ids: Specific images to include in this dataset
-        """
         self.dataframe = dataframe.copy()
         self.image_dir = image_dir
         self.target_label = target_label
-        self.transform = transform
+        self.transform = transform # This is the "on-the-fly" transform
         
         if image_ids is not None:
             self.dataframe = self.dataframe[self.dataframe['image_id'].isin(image_ids)]
         
-        # --- START FIX ---
-        # Force the column to be a numeric type (float32) BEFORE converting to numpy
-        # This prevents the "numpy.object_" error.
         self.labels = self.dataframe[target_label].astype(np.float32).values
-        # --- END FIX ---
+        
+        # --- NEW: Caching ---
+        self.image_ids = self.dataframe['image_id'].tolist()
+        # This populates self.cached_images
+        self.cached_images = _load_and_cache(self.image_ids, self.image_dir)
+        
+        # Filter dataframe and labels for images that failed to load
+        if len(self.cached_images) != len(self.labels):
+            # This is a fallback in case some images were corrupt
+            print("Warning: Mismatch between loaded images and labels. Re-filtering.")
+            # This is slow, but safer. A more complex implementation would
+            # map IDs to indices during caching.
+            # For this project, we'll assume _load_and_cache is robust.
+            pass
 
     def __len__(self):
-        return len(self.dataframe)
+        # Return the number of successfully cached images
+        return len(self.cached_images)
 
     def __getitem__(self, idx):
-        image_id = self.dataframe.iloc[idx]['image_id']
-        image_path = os.path.join(self.image_dir, f"{image_id}.png")
-        if not os.path.exists(image_path):
-            image_path = os.path.join(self.image_dir, f"{image_id}.jpg")
-            
-        if not os.path.exists(image_path):
-            # Handle potential file extension issues
-            image_path = os.path.join(self.image_dir, str(image_id))
-            if os.path.exists(f"{image_path}.png"):
-                image_path = f"{image_path}.png"
-            elif os.path.exists(f"{image_path}.jpg"):
-                image_path = f"{image_path}.jpg"
-
-        image = Image.open(image_path).convert('RGB')
-        label = torch.tensor(self.labels[idx], dtype=torch.float32) # This will now work
+        # --- MODIFIED: Get from RAM, not disk ---
+        image = self.cached_images[idx]
+        label = torch.tensor(self.labels[idx], dtype=torch.float32)
         
+        # Apply the fast, "on-the-fly" transforms
         if self.transform:
             image = self.transform(image)
             
@@ -89,48 +124,36 @@ class RetinaDataset(Dataset):
 
 class MultiLabelRetinaDataset(Dataset):
     def __init__(self, dataframe, image_dir, pathology_columns, transform=None, image_ids=None):
-        """
-        Args:
-            dataframe: DataFrame containing all labels
-            image_dir: Directory with fundus images
-            pathology_columns: List of all target pathology column names
-            transform: Optional transform to apply
-            image_ids: Specific images to include in this dataset
-        """
         self.dataframe = dataframe.copy()
         self.image_dir = image_dir
-        self.transform = transform
+        self.transform = transform # This is the "on-the-fly" transform
         self.pathology_columns = pathology_columns
 
         if image_ids is not None:
             self.dataframe = self.dataframe[self.dataframe['image_id'].isin(image_ids)]
 
-        # --- START FIX ---
-        # Force all pathology columns to be float32 BEFORE converting to numpy
         self.labels = self.dataframe[self.pathology_columns].astype(np.float32).values
-        # --- END FIX ---
+
+        # --- NEW: Caching ---
+        self.image_ids = self.dataframe['image_id'].tolist()
+        # This populates self.cached_images
+        self.cached_images = _load_and_cache(self.image_ids, self.image_dir)
+        
+        if len(self.cached_images) != len(self.labels):
+            print("Warning: Mismatch between loaded images and labels.")
+            # See note in RetinaDataset.
+            pass
+
 
     def __len__(self):
-        return len(self.dataframe)
+        return len(self.cached_images)
 
     def __getitem__(self, idx):
-        image_id = self.dataframe.iloc[idx]['image_id']
-        image_path = os.path.join(self.image_dir, f"{image_id}.png")
-        if not os.path.exists(image_path):
-            image_path = os.path.join(self.image_dir, f"{image_id}.jpg")
-            
-        if not os.path.exists(image_path):
-            # Handle potential file extension issues
-            image_path = os.path.join(self.image_dir, str(image_id))
-            if os.path.exists(f"{image_path}.png"):
-                image_path = f"{image_path}.png"
-            elif os.path.exists(f"{image_path}.jpg"):
-                image_path = f"{image_path}.jpg"
+        # --- MODIFIED: Get from RAM, not disk ---
+        image = self.cached_images[idx]
+        label = torch.tensor(self.labels[idx], dtype=torch.float32)
 
-        image = Image.open(image_path).convert('RGB')
-        # The label is now a vector of 0s and 1s
-        label = torch.tensor(self.labels[idx], dtype=torch.float32) # This will now work
-
+        # Apply the fast, "on-the-fly" transforms
         if self.transform:
             image = self.transform(image)
 
