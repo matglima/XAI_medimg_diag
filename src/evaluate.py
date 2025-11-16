@@ -26,10 +26,20 @@ logger = logging.getLogger(__name__)
 
 # This MUST match all other scripts
 PATHOLOGIES = [
-    'diabetic_retinopathy', 'age_related_macular_degeneration', 'glaucoma', 
-    'hypertensive_retinopathy', 'pathology_5', 'pathology_6', 'pathology_7', 
-    'pathology_8', 'pathology_9', 'pathology_10', 'pathology_11', 
-    'pathology_12', 'pathology_13', 'pathology_14'
+    'diabetes'
+    'diabetic_retinopathy'
+    'macular_edema'
+    'scar'
+    'nevus'
+    'amd'
+    'vascular_occlusion'
+    'hypertensive_retinopathy'
+    'drusens'
+    'hemorrhage'
+    'retinal_detachment'
+    'myopic_fundus'
+    'increased_cup_disc'
+    'other'
 ]
 
 def main(args):
