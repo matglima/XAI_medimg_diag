@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------
 # Description:
 # Phase 1A: Trains the Multi-Label "Gate" model.
-# NOW with robust AUC and async data transfer.
+# Now dynamically loads pathology list.
 # -----------------------------------------------------------------
 
 import argparse
@@ -20,28 +20,11 @@ import warnings
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from models import create_model, get_optimizer
+from config import get_pathology_list # <-- NEW IMPORT
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Define all pathologies (must match CSV headers)
-PATHOLOGIES = [
-    'diabetes',
-    'diabetic_retinopathy',
-    'macular_edema',
-    'scar',
-    'nevus',
-    'amd',
-    'vascular_occlusion',
-    'hypertensive_retinopathy',
-    'drusens',
-    'hemorrhage',
-    'retinal_detachment',
-    'myopic_fundus',
-    'increased_cup_disc',
-    'other'
-]
 
 # --- Helper Functions ---
 
@@ -102,7 +85,9 @@ def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # --- Load Data ---
+    # --- DYNAMICALLY LOAD PATHOLOGIES ---
+    PATHOLOGIES = get_pathology_list(args.labels_path)
+    
     logger.info("Loading labels...")
     labels_df = pd.read_csv(args.labels_path)
     labels_df['image_id'] = labels_df['image_id'].astype(str)
@@ -138,7 +123,7 @@ def main(args):
         model_name=args.model_name,
         model_size=args.model_size,
         pretrained=not args.no_pretrained,
-        num_classes=len(PATHOLOGIES),
+        num_classes=len(PATHOLOGIES), # <-- Dynamic
         use_lora=args.use_lora,
         use_qlora=args.use_qlora,
         lora_r=args.lora_r # <-- Pass lora_r
@@ -154,6 +139,7 @@ def main(args):
     epochs_no_improve = 0
     os.makedirs(args.output_dir, exist_ok=True)
     model_save_path = os.path.join(args.output_dir, "gate_best_model.pth")
+    lora_save_path = args.output_dir # save_pretrained saves to a directory
 
     for epoch in range(args.epochs):
         logger.info(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
@@ -176,8 +162,7 @@ def main(args):
             logger.info(f"Val AUC improved ({best_val_auc:.4f} --> {val_metrics['auc_macro']:.4f}). Saving model...")
             best_val_auc = val_metrics['auc_macro']
             if args.use_lora:
-                # Save only the LoRA adapters
-                model.model.save_pretrained(args.output_dir)
+                model.model.save_pretrained(lora_save_path) # <-- Use correct path
             else:
                 # Save the full model
                 torch.save(model.state_dict(), model_save_path)
@@ -192,7 +177,7 @@ def main(args):
             
     logger.info(f"Training complete. Best Val AUC: {best_val_auc:.4f}")
     if args.use_lora:
-        logger.info(f"Best LoRA adapters saved in: {args.output_dir}")
+        logger.info(f"Best LoRA adapters saved in: {lora_save_path}")
     else:
         logger.info(f"Best model saved to: {model_save_path}")
 
@@ -217,7 +202,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
     parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
     parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
-    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA") # <-- NEW ARGUMENT
+    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA")
     
     args = parser.parse_args()
     main(args)

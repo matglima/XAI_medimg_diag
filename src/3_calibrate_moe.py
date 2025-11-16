@@ -21,33 +21,19 @@ import warnings
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform
 from moe_model import HybridMoE
 from models import get_optimizer
+from config import get_pathology_list # <-- NEW IMPORT
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# This MUST match the list in 1_train_gate.py and run_all_experts.sh
-PATHOLOGIES = [
-    'diabetes',
-    'diabetic_retinopathy',
-    'macular_edema',
-    'scar',
-    'nevus',
-    'amd',
-    'vascular_occlusion',
-    'hypertensive_retinopathy',
-    'drusens',
-    'hemorrhage',
-    'retinal_detachment',
-    'myopic_fundus',
-    'increased_cup_disc',
-    'other'
-]
-
 # --- Main Calibration Function ---
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
+    
+    # --- DYNAMICALLY LOAD PATHOLOGIES ---
+    PATHOLOGIES = get_pathology_list(args.labels_path)
     
     # --- Define Model Configurations ---
     # These MUST match the configs used for training
@@ -56,19 +42,19 @@ def main(args):
         'model_size': args.gate_model_size,
         'use_lora': args.gate_use_lora,
         'use_qlora': args.gate_use_qlora,
-        'lora_r': args.lora_r # <-- Pass lora_r
+        'lora_r': args.lora_r
     }
     expert_config = {
         'model_name': args.expert_model_name,
         'model_size': args.expert_model_size,
         'use_lora': args.expert_use_lora,
         'use_qlora': args.expert_use_qlora,
-        'lora_r': args.lora_r # <-- Pass lora_r
+        'lora_r': args.lora_r
     }
 
     # --- 1. Initialize MoE Structure ---
     logger.info("Initializing HybridMoE structure...")
-    moe = HybridMoE(gate_config, expert_config, PATHOLOGIES, device)
+    moe = HybridMoE(gate_config, expert_config, PATHOLOGIES, device) # <-- Pass dynamic list
     
     # --- 2. Load All Checkpoints ---
     logger.info("Loading pre-trained checkpoints...")
@@ -141,20 +127,9 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     save_path = os.path.join(args.output_dir, "moe_calibrated_final.pth")
     
-    # IMPORTANT: Save the *entire* model state dict,
-    # as it now contains all loaded+calibrated components.
-    
-    # If LoRA was used, merge weights before saving for easy inference
-    if args.gate_use_lora or args.expert_use_lora:
-        logger.info("Merging LoRA adapters into base model for saving...")
-        if hasattr(moe.gate, 'model') and hasattr(moe.gate.model, 'merge_and_unload'):
-            moe.gate.model = moe.gate.model.merge_and_unload()
-        for expert in moe.experts:
-            if hasattr(expert, 'model') and hasattr(expert.model, 'merge_and_unload'):
-                expert.model = expert.model.merge_and_unload()
-        logger.info("Adapters merged.")
-    
+    logger.info("Saving calibrated model state dict (with adapters)...")
     torch.save(moe.state_dict(), save_path)
+    
     logger.info(f"Final calibrated model saved to {save_path}")
 
 if __name__ == "__main__":
@@ -180,7 +155,7 @@ if __name__ == "__main__":
     parser.add_argument('--expert-model-size', type=str, default='small')
     parser.add_argument('--expert-use-lora', action='store_true')
     parser.add_argument('--expert-use-qlora', action='store_true')
-    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA (must match training)") # <-- NEW ARGUMENT
+    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA (must match training)")
     parser.add_argument('--epochs', type=int, default=3, help="Number of calibration epochs (SHORT)")
     parser.add_argument('--batch-size', type=int, default=16, help="Batch size (use smaller for calibration)")
     parser.add_argument('--lr', type=float, default=1e-6, help="Learning rate (VERY LOW)")

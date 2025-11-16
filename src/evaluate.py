@@ -16,59 +16,111 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix, classification_report
 from tqdm import tqdm
 import os
+import warnings
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, val_transform
 from moe_model import HybridMoE
+from config import get_pathology_list # <-- NEW IMPORT
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# This MUST match all other scripts
-PATHOLOGIES = [
-    'diabetes',
-    'diabetic_retinopathy',
-    'macular_edema',
-    'scar',
-    'nevus',
-    'amd',
-    'vascular_occlusion',
-    'hypertensive_retinopathy',
-    'drusens',
-    'hemorrhage',
-    'retinal_detachment',
-    'myopic_fundus',
-    'increased_cup_disc',
-    'other'
-]
+def get_metrics_report(targets, preds, pathology_list): # <-- Pass list as arg
+    """Generates a detailed, multi-line string report."""
+    preds_rounded = np.round(preds)
+    report_lines = []
+    
+    # Overall Metrics
+    f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
+    
+    # Robust AUC
+    auc_scores = []
+    num_classes = targets.shape[1]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for i in range(num_classes):
+            try:
+                if len(np.unique(targets[:, i])) > 1:
+                    auc_scores.append(roc_auc_score(targets[:, i], preds[:, i]))
+                else:
+                    auc_scores.append(np.nan) # Use nan to ignore in mean
+            except ValueError:
+                auc_scores.append(np.nan)
+                
+    auc_macro = np.nanmean(auc_scores)
+    
+    report_lines.append("\n--- FINAL MODEL EVALUATION REPORT ---")
+    report_lines.append(f"\nOverall Metrics (Macro Average):")
+    report_lines.append(f"  Macro F1-Score: {f1_macro:.4f}")
+    report_lines.append(f"  Macro AUC:      {auc_macro:.4f}")
+    
+    # Per-Class Metrics
+    report_lines.append("\nPer-Class Metrics:")
+    report_lines.append("=" * 60)
+    report_lines.append(f"{'Pathology':<35} | {'AUC':<7} | {'F1-Score':<10}")
+    report_lines.append("-" * 60)
+    
+    for i, pathology in enumerate(pathology_list): # <-- Use dynamic list
+        class_auc = auc_scores[i] if not np.isnan(auc_scores[i]) else 0.0
+        class_f1 = f1_score(targets[:, i], preds_rounded[:, i], zero_division=0)
+        auc_str = f"{class_auc:<7.4f}" if not np.isnan(auc_scores[i]) else "N/A    "
+        report_lines.append(f"{pathology:<35} | {auc_str} | {class_f1:<10.4f}")
+    
+    report_lines.append("=" * 60)
+    
+    report_lines.append("\nClassification Report (Micro/Macro/Weighted):")
+    class_report = classification_report(targets, preds_rounded, target_names=pathology_list, zero_division=0)
+    report_lines.append(class_report)
+    report_lines.append("--- END OF REPORT ---")
+    
+    return "\n".join(report_lines)
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # --- 1. Define Model Configs (must match calibration) ---
+    # --- DYNAMICALLY LOAD PATHOLOGIES ---
+    PATHOLOGIES = get_pathology_list(args.labels_path)
+    
+    # --- 1. Define Model Configs (must match training) ---
     gate_config = {
         'model_name': args.gate_model_name,
         'model_size': args.gate_model_size,
-        'use_lora': False, 'use_qlora': False # weights are merged, so LoRA=False
+        'use_lora': args.gate_use_lora,
+        'use_qlora': args.gate_use_qlora,
+        'lora_r': args.lora_r
     }
     expert_config = {
         'model_name': args.expert_model_name,
         'model_size': args.expert_model_size,
-        'use_lora': False, 'use_qlora': False
+        'use_lora': args.expert_use_lora,
+        'use_qlora': args.expert_use_qlora,
+        'lora_r': args.lora_r
     }
 
-    # --- 2. Initialize MoE Structure ---
-    logger.info("Initializing HybridMoE structure for evaluation...")
+    # --- 2. Initialize MoE Structure (with adapters) ---
+    logger.info("Initializing HybridMoE structure for evaluation (with adapters)...")
     model = HybridMoE(gate_config, expert_config, PATHOLOGIES, device)
     
-    # --- 3. Load Final Calibrated Weights ---
+    # --- 3. Load Final Calibrated Weights (loads adapter weights) ---
     logger.info(f"Loading final calibrated model from: {args.model_path}")
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
     model.to(device)
+
+    # --- 4. Merge adapters for efficient inference ---
+    if args.gate_use_lora or args.expert_use_lora:
+        logger.info("Merging LoRA adapters into base model for evaluation...")
+        if hasattr(model.gate, 'model') and hasattr(model.gate.model, 'merge_and_unload'):
+            model.gate.model = model.gate.model.merge_and_unload()
+        for expert in model.experts:
+            if hasattr(expert, 'model') and hasattr(expert.model, 'merge_and_unload'):
+                expert.model = expert.model.merge_and_unload()
+        logger.info("Adapters merged.")
+
     model.eval()
 
-    # --- 4. Load Test Data ---
+    # --- 5. Load Test Data ---
     logger.info("Loading test data...")
     labels_df = pd.read_csv(args.labels_path)
     labels_df['image_id'] = labels_df['image_id'].astype(str)
@@ -84,51 +136,28 @@ def main(args):
     )
     logger.info(f"Test samples: {len(test_dataset)}")
 
-    # --- 5. Run Evaluation ---
+    # --- 6. Run Evaluation ---
     all_preds = []
     all_targets = []
     
     with torch.no_grad():
         for images, targets in tqdm(test_loader, desc="Evaluating on Test Set"):
-            images = images.to(device)
-            
+            images = images.to(device, non_blocking=True)
             outputs = model(images)
-            
             all_preds.append(torch.sigmoid(outputs).cpu().numpy())
             all_targets.append(targets.cpu().numpy())
 
     all_preds = np.concatenate(all_preds, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
-    all_preds_rounded = np.round(all_preds)
     
-    # --- 6. Print Full Report ---
-    logger.info("\n--- FINAL MODEL EVALUATION REPORT ---")
+    # --- 7. Print Full Report ---
+    report = get_metrics_report(all_targets, all_preds, PATHOLOGIES)
+    logger.info(report)
     
-    # Overall Metrics
-    f1_macro = f1_score(all_targets, all_preds_rounded, average='macro', zero_division=0)
-    auc_macro = roc_auc_score(all_targets, all_preds, average='macro')
-    
-    logger.info(f"\nOverall Metrics (Macro Average):")
-    logger.info(f"  Macro F1-Score: {f1_macro:.4f}")
-    logger.info(f"  Macro AUC:      {auc_macro:.4f}")
-    
-    # Per-Class Metrics
-    logger.info("\nPer-Class Metrics:")
-    print("=" * 60)
-    print(f"{'Pathology':<35} | {'AUC':<7} | {'F1-Score':<10}")
-    print("-" * 60)
-    
-    for i, pathology in enumerate(PATHOLOGIES):
-        class_auc = roc_auc_score(all_targets[:, i], all_preds[:, i])
-        class_f1 = f1_score(all_targets[:, i], all_preds_rounded[:, i], zero_division=0)
-        print(f"{pathology:<35} | {class_auc:<7.4f} | {class_f1:<10.4f}")
-    
-    print("=" * 60)
-    
-    logger.info("\nClassification Report (Micro/Macro/Weighted):")
-    report = classification_report(all_targets, all_preds_rounded, target_names=PATHOLOGIES, zero_division=0)
-    print(report)
-    logger.info("--- END OF REPORT ---")
+    report_path = os.path.join(os.path.dirname(args.model_path), "final_evaluation_report.txt")
+    with open(report_path, "w") as f:
+        f.write(report)
+    logger.info(f"Report saved to {report_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Final Hybrid MoE Model")
@@ -139,12 +168,17 @@ if __name__ == "__main__":
     
     # Model path
     parser.add_argument('--model-path', type=str, default="checkpoints/final_moe/moe_calibrated_final.pth", help="Path to final calibrated .pth model")
-
-    # Model Config (must match calibration)
+    
+    # --- Model Config Flags ---
     parser.add_argument('--gate-model-name', type=str, default='resnet')
     parser.add_argument('--gate-model-size', type=str, default='small')
+    parser.add_argument('--gate-use-lora', action='store_true')
+    parser.add_argument('--gate-use-qlora', action='store_true')
     parser.add_argument('--expert-model-name', type=str, default='resnet')
     parser.add_argument('--expert-model-size', type=str, default='small')
+    parser.add_argument('--expert-use-lora', action='store_true')
+    parser.add_argument('--expert-use-qlora', action='store_true')
+    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA (must match training)")
     
     # Eval params
     parser.add_argument('--batch-size', type=int, default=32, help="Batch size for evaluation")
