@@ -3,6 +3,7 @@
 # -----------------------------------------------------------------
 # Description:
 # Phase 1A: Trains the Multi-Label "Gate" model.
+# NOW with robust AUC and async data transfer.
 # -----------------------------------------------------------------
 
 import argparse
@@ -15,7 +16,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from tqdm import tqdm
 import os
-import warnings
+import warnings # <-- IMPORT WARNINGS
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from models import create_model, get_optimizer
@@ -53,8 +54,10 @@ def run_epoch(model, loader, criterion, optimizer, device, is_training):
 
     progress_bar = tqdm(loader, desc="Training" if is_training else "Validation")
     for images, targets in progress_bar:
-        images = images.to(device, non_blocking=True) # Use non_blocking for pin_memory
+        # --- START FIX: Use non_blocking=True ---
+        images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+        # --- END FIX ---
 
         with torch.set_grad_enabled(is_training):
             outputs = model(images)
@@ -90,15 +93,18 @@ def get_metrics(targets, preds):
         warnings.simplefilter("ignore")
         for i in range(num_classes):
             try:
-                class_auc = roc_auc_score(targets[:, i], preds[:, i])
-                auc_scores.append(class_auc)
+                # Check if both classes are present
+                if len(np.unique(targets[:, i])) > 1:
+                    class_auc = roc_auc_score(targets[:, i], preds[:, i])
+                    auc_scores.append(class_auc)
+                else:
+                    # Only one class present, append 0.5 (neutral) or np.nan
+                    auc_scores.append(0.5) 
             except ValueError:
-                # This happens if (e.g.) all labels are 0 for this class
-                # We'll append 0.5 as a neutral score, or you could append np.nan
-                auc_scores.append(0.5) 
+                auc_scores.append(0.5) # Fallback
                 
     # Calculate macro average from the list of scores
-    auc_macro = np.mean(auc_scores)
+    auc_macro = np.nanmean(auc_scores) # Use nanmean in case we appended np.nan
     # --- END FIX ---
 
     f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
@@ -121,6 +127,9 @@ def main(args):
     logger.info("Creating random splits...")
     splits = get_random_splits(labels_df, test_size=0.2, val_size=0.1)
     
+    # Note: The transforms are now passed from the global scope
+    # The Dataset will pre-cache using pre_transform
+    # and apply train_transform/val_transform on-the-fly
     train_dataset = MultiLabelRetinaDataset(
         labels_df, args.image_dir, PATHOLOGIES, train_transform, splits['train']
     )
@@ -130,11 +139,11 @@ def main(args):
     
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, 
-        num_workers=args.num_workers, pin_memory=True # <-- ADDED pin_memory
+        num_workers=args.num_workers, pin_memory=True # pin_memory=True is important
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False, 
-        num_workers=args.num_workers, pin_memory=True # <-- ADDED pin_memory
+        num_workers=args.num_workers, pin_memory=True
     )
     
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
@@ -221,13 +230,20 @@ if __name__ == "__main__":
     # Training params
     parser.add_argument('--epochs', type=int, default=50, help="Max number of epochs")
     parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
-    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate")
-    parser.add_argument('--patience', type=int, default=5, help="Early stopping patience")
-    parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
+    parser.add.argument('--lr', type=float, default=1e-4, help="Learning rate")
+    parser.add.argument('--patience', type=int, default=5, help="Early stopping patience")
+    parser.add.argument('--num-workers', type=int, default=4, help="Dataloader workers")
     
     # LoRA / Q-LoRA params
     parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
     parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
     
     args = parser.parse_args()
+    
+    # --- RECOMMENDATION ---
+    # Your batch size of 1024 was likely the main cause of the bottleneck.
+    # A smaller size like 64, 128, or 256 is recommended.
+    # The --batch-size default is now 32, but you passed 1024.
+    # Try a lower number in your run_full_pipeline.py script.
+    
     main(args)
