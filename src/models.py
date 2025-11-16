@@ -130,21 +130,26 @@ class ModelWrapper(nn.Module):
         weights = 'DEFAULT' if pretrained else None
         model_fn = self._get_model_fn()
         
-        quantization_config = None
+        # --- START FIX ---
+        # Prepare kwargs for the model constructor
+        model_kwargs = {
+            'weights': weights
+        }
+
         if self.use_qlora:
+            # Only add quantization_config if it's actually being used
             quantization_config = bnb.BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16
             )
+            model_kwargs['quantization_config'] = quantization_config
 
-        # Load the base model with or without quantization
-        model = model_fn(
-            weights=weights,
-            quantization_config=quantization_config
-        )
-
+        # Load the base model
+        model = model_fn(**model_kwargs)
+        # --- END FIX ---
+        
         # Modify the head BEFORE applying LoRA
         self._modify_head(model)
         
