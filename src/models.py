@@ -130,7 +130,6 @@ class ModelWrapper(nn.Module):
         weights = 'DEFAULT' if pretrained else None
         model_fn = self._get_model_fn()
         
-        # --- START FIX ---
         # Prepare kwargs for the model constructor
         model_kwargs = {
             'weights': weights
@@ -148,24 +147,19 @@ class ModelWrapper(nn.Module):
 
         # Load the base model
         model = model_fn(**model_kwargs)
-        # --- END FIX ---
         
         # Modify the head BEFORE applying LoRA
         self._modify_head(model)
         
         if self.use_lora:
             # Find all linear layers to target for LoRA
-            # This is a robust way to catch them in CNNs and Transformers
             target_modules = []
             for name, module in model.named_modules():
                 if isinstance(module, (nn.Linear, bnb.nn.Linear4bit)):
-                    # Get the final part of the name (e.g., 'fc', 'query', 'classifier')
                     module_name = name.split('.')[-1]
                     if module_name not in target_modules:
                          target_modules.append(module_name)
             
-            # Ensure we don't target the final classification head if it's not quantized
-            # Or, just target common module names
             target_modules = ['query', 'key', 'value', 'fc', 'fc1', 'fc2', 'head', 'classifier']
 
             lora_config = LoraConfig(
@@ -174,7 +168,7 @@ class ModelWrapper(nn.Module):
                 target_modules=target_modules,
                 lora_dropout=0.1,
                 bias="none",
-                task_type=TaskType.FEATURE_EXTRACTION # Use this for general vision models
+                task_type=TaskType.FEATURE_EXTRACTION
             )
             
             model = get_peft_model(model, lora_config)
@@ -183,8 +177,15 @@ class ModelWrapper(nn.Module):
 
         return model
 
+    # --- START FIX ---
     def forward(self, x):
-        return self.model(x)
+        # We must pass 'x' as a keyword argument
+        # because the PeftModel wrapper's 'forward' method
+        # is designed for text models (e.g., input_ids=...).
+        # By passing 'x=' explicitly, it bypasses this
+        # and passes the kwarg directly to ResNet's forward pass.
+        return self.model(x=x)
+    # --- END FIX ---
 
 
 def create_model(model_name, model_size='base', pretrained=True, num_classes=1, use_lora=False, use_qlora=False):
