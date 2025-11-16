@@ -162,14 +162,16 @@ class ModelWrapper(nn.Module):
             
             target_modules = ['query', 'key', 'value', 'fc', 'fc1', 'fc2', 'head', 'classifier']
 
+            # --- START FIX ---
             lora_config = LoraConfig(
                 r=16,
                 lora_alpha=32,
                 target_modules=target_modules,
                 lora_dropout=0.1,
                 bias="none",
-                task_type=TaskType.FEATURE_EXTRACTION
+                # REMOVED task_type to prevent text-model assumptions
             )
+            # --- END FIX ---
             
             model = get_peft_model(model, lora_config)
             print("Successfully applied LoRA/Q-LoRA to model.")
@@ -179,12 +181,10 @@ class ModelWrapper(nn.Module):
 
     # --- START FIX ---
     def forward(self, x):
-        # We must pass 'x' as a keyword argument
-        # because the PeftModel wrapper's 'forward' method
-        # is designed for text models (e.g., input_ids=...).
-        # By passing 'x=' explicitly, it bypasses this
-        # and passes the kwarg directly to ResNet's forward pass.
-        return self.model(x=x)
+        # Pass 'x' as a positional argument.
+        # This prevents the PeftModel wrapper from
+        # trying to pass it as 'input_ids'.
+        return self.model(x)
     # --- END FIX ---
 
 
