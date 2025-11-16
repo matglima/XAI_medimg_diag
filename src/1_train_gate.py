@@ -20,7 +20,7 @@ import warnings
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from models import create_model, get_optimizer
-from config import get_pathology_list # <-- NEW IMPORT
+from config import BRSET_LABELS # <-- NEW IMPORT
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -86,7 +86,7 @@ def main(args):
     logger.info(f"Using device: {device}")
     
     # --- DYNAMICALLY LOAD PATHOLOGIES ---
-    PATHOLOGIES = get_pathology_list(args.labels_path)
+    PATHOLOGIES = BRSET_LABELS
     
     logger.info("Loading labels...")
     labels_df = pd.read_csv(args.labels_path)

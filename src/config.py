@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------
 # File: src/config.py
 # -----------------------------------------------------------------
-PATHOLOGIES = [
+BRSET_LABELS = [
     'diabetes',
     'diabetic_retinopathy',
     'macular_edema',

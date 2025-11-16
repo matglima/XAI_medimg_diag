@@ -21,7 +21,7 @@ import warnings
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform
 from moe_model import HybridMoE
 from models import get_optimizer
-from config import get_pathology_list # <-- NEW IMPORT
+from config import BRSET_LABELS # <-- NEW IMPORT
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,7 +33,7 @@ def main(args):
     logger.info(f"Using device: {device}")
     
     # --- DYNAMICALLY LOAD PATHOLOGIES ---
-    PATHOLOGIES = get_pathology_list(args.labels_path)
+    PATHOLOGIES = BRSET_LABELS
     
     # --- Define Model Configurations ---
     # These MUST match the configs used for training
