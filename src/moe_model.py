@@ -8,7 +8,7 @@
 
 import torch
 import torch.nn as nn
-from models import create_model
+from models import create_model # This now accepts lora_r
 import os
 
 try:
@@ -19,13 +19,13 @@ except ImportError:
     print("Warning: 'peft' not found. Loading LoRA adapters will fail.")
 
 class HybridMoE(nn.Module):
-    def __init__(self, gate_config, expert_configs, pathology_list, device):
+    def __init__(self, gate_config, expert_config, pathology_list, device):
         """
         Initializes the MoE structure *without* weights.
         
         Args:
-            gate_config (dict): Kwargs for create_model (name, size, lora, qlora)
-            expert_configs (dict): Kwargs for *one* expert (name, size, lora, qlora)
+            gate_config (dict): Kwargs for create_model (name, size, lora, qlora, lora_r)
+            expert_config (dict): Kwargs for *one* expert (name, size, lora, qlora, lora_r)
             pathology_list (list): List of pathology names in order.
             device: The torch device to load models onto.
         """
@@ -44,7 +44,7 @@ class HybridMoE(nn.Module):
         self.experts = nn.ModuleList()
         for _ in self.pathology_list:
             expert = create_model(
-                **expert_configs,
+                **expert_config,
                 num_classes=1,
                 pretrained=False # We will load weights
             ).to(device)

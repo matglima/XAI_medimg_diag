@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------
 # Description:
 # Defines the ModelWrapper. This is the core model creation factory,
-# now with support for num_classes, LoRA, and Q-LoRA.
+# now with support for num_classes, LoRA, Q-LoRA, and custom lora_r.
 # -----------------------------------------------------------------
 
 import torch
@@ -31,7 +31,8 @@ class ModelWrapper(nn.Module):
                  pretrained: bool = True,
                  num_classes: int = 1,
                  use_lora: bool = False,
-                 use_qlora: bool = False):
+                 use_qlora: bool = False,
+                 lora_r: int = 16): # <-- NEW ARGUMENT
         """
         Wrapper to create a model with optional LoRA/Q-LoRA.
 
@@ -56,6 +57,7 @@ class ModelWrapper(nn.Module):
         self.num_classes = num_classes
         self.use_lora = use_lora
         self.use_qlora = use_qlora
+        self.lora_r = lora_r # <-- SAVE ARGUMENT
 
         # Create base model with new weights API
         self.model = self._create_model(pretrained)
@@ -162,16 +164,13 @@ class ModelWrapper(nn.Module):
             
             target_modules = ['query', 'key', 'value', 'fc', 'fc1', 'fc2', 'head', 'classifier']
 
-            # --- START FIX ---
             lora_config = LoraConfig(
-                r=16,
-                lora_alpha=32,
+                r=self.lora_r, # <-- USE lora_r
+                lora_alpha=self.lora_r * 2, # Alpha is often 2*r
                 target_modules=target_modules,
                 lora_dropout=0.1,
                 bias="none",
-                # REMOVED task_type to prevent text-model assumptions
             )
-            # --- END FIX ---
             
             model = get_peft_model(model, lora_config)
             print("Successfully applied LoRA/Q-LoRA to model.")
@@ -179,16 +178,12 @@ class ModelWrapper(nn.Module):
 
         return model
 
-    # --- START FIX ---
     def forward(self, x):
-        # Pass 'x' as a positional argument.
-        # This prevents the PeftModel wrapper from
-        # trying to pass it as 'input_ids'.
         return self.model(x)
-    # --- END FIX ---
 
 
-def create_model(model_name, model_size='base', pretrained=True, num_classes=1, use_lora=False, use_qlora=False):
+def create_model(model_name, model_size='base', pretrained=True, num_classes=1, 
+                 use_lora=False, use_qlora=False, lora_r=16): # <-- NEW ARGUMENT
     """
     Factory function to create the ModelWrapper.
     """
@@ -198,7 +193,8 @@ def create_model(model_name, model_size='base', pretrained=True, num_classes=1, 
         pretrained=pretrained,
         num_classes=num_classes,
         use_lora=use_lora,
-        use_qlora=use_qlora
+        use_qlora=use_qlora,
+        lora_r=lora_r # <-- PASS ARGUMENT
     )
 
 def get_optimizer(model, lr, use_qlora=False):

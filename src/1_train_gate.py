@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from tqdm import tqdm
 import os
-import warnings # <-- IMPORT WARNINGS
+import warnings
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from models import create_model, get_optimizer
@@ -47,44 +47,33 @@ PATHOLOGIES = [
 
 def run_epoch(model, loader, criterion, optimizer, device, is_training):
     model.train() if is_training else model.eval()
-    
     total_loss = 0
-    all_preds = []
-    all_targets = []
-
+    all_preds, all_targets = [], []
     progress_bar = tqdm(loader, desc="Training" if is_training else "Validation")
+    
     for images, targets in progress_bar:
-        # --- START FIX: Use non_blocking=True ---
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        # --- END FIX ---
-
         with torch.set_grad_enabled(is_training):
             outputs = model(images)
             loss = criterion(outputs, targets)
-            
             if is_training:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
         total_loss += loss.item()
         all_preds.append(torch.sigmoid(outputs).detach().cpu().numpy())
         all_targets.append(targets.cpu().numpy())
-        
         progress_bar.set_postfix(loss=total_loss / (len(all_preds)))
-
+        
     avg_loss = total_loss / len(loader)
     all_preds = np.concatenate(all_preds, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
-    
     return avg_loss, all_preds, all_targets
 
 def get_metrics(targets, preds):
     # Calculate metrics for multi-label classification
     preds_rounded = np.round(preds)
-    
-    # --- START FIX: Robust AUC Calculation ---
     auc_scores = []
     num_classes = targets.shape[1]
     
@@ -95,18 +84,13 @@ def get_metrics(targets, preds):
             try:
                 # Check if both classes are present
                 if len(np.unique(targets[:, i])) > 1:
-                    class_auc = roc_auc_score(targets[:, i], preds[:, i])
-                    auc_scores.append(class_auc)
+                    auc_scores.append(roc_auc_score(targets[:, i], preds[:, i]))
                 else:
                     # Only one class present, append 0.5 (neutral) or np.nan
                     auc_scores.append(0.5) 
             except ValueError:
-                auc_scores.append(0.5) # Fallback
-                
-    # Calculate macro average from the list of scores
-    auc_macro = np.nanmean(auc_scores) # Use nanmean in case we appended np.nan
-    # --- END FIX ---
-
+                auc_scores.append(0.5)
+    auc_macro = np.nanmean(auc_scores)
     f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
     acc = accuracy_score(targets, preds_rounded) # This is subset accuracy (very strict)
     
@@ -156,7 +140,8 @@ def main(args):
         pretrained=not args.no_pretrained,
         num_classes=len(PATHOLOGIES),
         use_lora=args.use_lora,
-        use_qlora=args.use_qlora
+        use_qlora=args.use_qlora,
+        lora_r=args.lora_r # <-- Pass lora_r
     ).to(device)
 
     # --- Loss and Optimizer ---
@@ -167,7 +152,6 @@ def main(args):
     # --- Training Loop ---
     best_val_auc = 0
     epochs_no_improve = 0
-    
     os.makedirs(args.output_dir, exist_ok=True)
     model_save_path = os.path.join(args.output_dir, "gate_best_model.pth")
 
@@ -188,7 +172,6 @@ def main(args):
         
         scheduler.step(val_metrics['auc_macro'])
         
-        # --- Save Best Model (based on Val AUC) ---
         if val_metrics['auc_macro'] > best_val_auc:
             logger.info(f"Val AUC improved ({best_val_auc:.4f} --> {val_metrics['auc_macro']:.4f}). Saving model...")
             best_val_auc = val_metrics['auc_macro']
@@ -213,7 +196,6 @@ def main(args):
     else:
         logger.info(f"Best model saved to: {model_save_path}")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Multi-Label Gate Model")
     
@@ -230,17 +212,12 @@ if __name__ == "__main__":
     # Training params
     parser.add_argument('--epochs', type=int, default=50, help="Max number of epochs")
     parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
-    
-    # --- START FIX: Corrected .add.argument to .add_argument ---
     parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate")
     parser.add_argument('--patience', type=int, default=5, help="Early stopping patience")
     parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
-    # --- END FIX ---
-    
-    # LoRA / Q-LoRA params
     parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
     parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
+    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA") # <-- NEW ARGUMENT
     
     args = parser.parse_args()
-    
     main(args)

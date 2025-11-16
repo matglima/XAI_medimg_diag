@@ -3,7 +3,6 @@
 # -----------------------------------------------------------------
 # Description:
 # Phase 1B: Trains the 14 Binary "Expert" models.
-# This is a refactor of your original train.py.
 # -----------------------------------------------------------------
 
 import argparse
@@ -16,6 +15,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score
 from tqdm import tqdm
 import os
+import warnings
 
 from dataloader import RetinaDataset, get_stratified_splits, train_transform, val_transform
 from models import create_model, get_optimizer
@@ -31,18 +31,14 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
-
     def forward(self, inputs, targets):
         BCE_loss = nn.functional.binary_cross_entropy_with_logits(
             inputs, targets.float(), reduction='none'
         )
         pt = torch.exp(-BCE_loss)
         focal_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
+        if self.reduction == 'mean': return focal_loss.mean()
+        elif self.reduction == 'sum': return focal_loss.sum()
         return focal_loss
 
 # --- Main Trainer Class ---
@@ -68,6 +64,7 @@ class ExpertTrainer:
         logger.info("Creating stratified splits...")
         splits = get_stratified_splits(labels_df, self.target_label)
         
+        # Dataloader will now load from the pre-built cache
         train_dataset = RetinaDataset(
             labels_df, args.image_dir, self.target_label, train_transform, splits['train']
         )
@@ -94,7 +91,8 @@ class ExpertTrainer:
             pretrained=not args.no_pretrained,
             num_classes=1, # Binary expert
             use_lora=args.use_lora,
-            use_qlora=args.use_qlora
+            use_qlora=args.use_qlora,
+            lora_r=args.lora_r # <-- Pass lora_r
         ).to(self.device)
 
         # --- Loss and Optimizer ---
@@ -104,12 +102,10 @@ class ExpertTrainer:
 
     def _run_epoch(self, loader, is_training):
         self.model.train() if is_training else self.model.eval()
-        
         total_loss = 0
-        all_preds = []
-        all_targets = []
-
+        all_preds, all_targets = [], []
         progress_bar = tqdm(loader, desc=f"Training {self.target_label}" if is_training else f"Validation {self.target_label}")
+        
         for images, targets in progress_bar:
             images = images.to(self.device)
             targets = targets.to(self.device).squeeze() # Ensure 1D
@@ -117,22 +113,18 @@ class ExpertTrainer:
             with torch.set_grad_enabled(is_training):
                 outputs = self.model(images).squeeze() # Output shape (batch_size)
                 loss = self.criterion(outputs, targets)
-                
                 if is_training:
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
-
             total_loss += loss.item()
             all_preds.append(torch.sigmoid(outputs).detach().cpu().numpy())
             all_targets.append(targets.cpu().numpy())
-            
             progress_bar.set_postfix(loss=total_loss / (len(all_preds)))
-
+            
         avg_loss = total_loss / len(loader)
         all_preds = np.concatenate(all_preds, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
-        
         return avg_loss, all_preds, all_targets
 
     def train(self):
@@ -143,13 +135,25 @@ class ExpertTrainer:
             logger.info(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
             
             train_loss, train_preds, train_targets = self._run_epoch(self.train_loader, is_training=True)
-            train_auc = roc_auc_score(train_targets, train_preds)
-            train_f1 = f1_score(train_targets, np.round(train_preds), zero_division=0)
+            
+            # --- Robust Metrics for Binary ---
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    train_auc = roc_auc_score(train_targets, train_preds)
+                except ValueError:
+                    train_auc = 0.5
+                train_f1 = f1_score(train_targets, np.round(train_preds), zero_division=0)
             logger.info(f"Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f} | Train F1: {train_f1:.4f}")
 
             val_loss, val_preds, val_targets = self._run_epoch(self.val_loader, is_training=False)
-            val_auc = roc_auc_score(val_targets, val_preds)
-            val_f1 = f1_score(val_targets, np.round(val_preds), zero_division=0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    val_auc = roc_auc_score(val_targets, val_preds)
+                except ValueError:
+                    val_auc = 0.5
+                val_f1 = f1_score(val_targets, np.round(val_preds), zero_division=0)
             logger.info(f"Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Val F1: {val_f1:.4f}")
             
             self.scheduler.step(val_auc)
@@ -201,6 +205,7 @@ if __name__ == "__main__":
     # LoRA / Q-LoRA params
     parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
     parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
+    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA") # <-- NEW ARGUMENT
     
     args = parser.parse_args()
     trainer = ExpertTrainer(args)

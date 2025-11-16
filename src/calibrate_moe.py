@@ -16,10 +16,11 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score
 from tqdm import tqdm
 import os
+import warnings
 
-from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
+from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform
 from moe_model import HybridMoE
-from models import get_optimizer # Re-use optimizer factory
+from models import get_optimizer
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,10 +28,20 @@ logger = logging.getLogger(__name__)
 
 # This MUST match the list in 1_train_gate.py and run_all_experts.sh
 PATHOLOGIES = [
-    'diabetic_retinopathy', 'age_related_macular_degeneration', 'glaucoma', 
-    'hypertensive_retinopathy', 'pathology_5', 'pathology_6', 'pathology_7', 
-    'pathology_8', 'pathology_9', 'pathology_10', 'pathology_11', 
-    'pathology_12', 'pathology_13', 'pathology_14'
+    'diabetes',
+    'diabetic_retinopathy',
+    'macular_edema',
+    'scar',
+    'nevus',
+    'amd',
+    'vascular_occlusion',
+    'hypertensive_retinopathy',
+    'drusens',
+    'hemorrhage',
+    'retinal_detachment',
+    'myopic_fundus',
+    'increased_cup_disc',
+    'other'
 ]
 
 # --- Main Calibration Function ---
@@ -45,12 +56,14 @@ def main(args):
         'model_size': args.gate_model_size,
         'use_lora': args.gate_use_lora,
         'use_qlora': args.gate_use_qlora,
+        'lora_r': args.lora_r # <-- Pass lora_r
     }
     expert_config = {
         'model_name': args.expert_model_name,
         'model_size': args.expert_model_size,
         'use_lora': args.expert_use_lora,
         'use_qlora': args.expert_use_qlora,
+        'lora_r': args.lora_r # <-- Pass lora_r
     }
 
     # --- 1. Initialize MoE Structure ---
@@ -73,9 +86,7 @@ def main(args):
     
     # --- 3. Freeze Parameters for Calibration ---
     logger.info("Freezing model parameters for calibration...")
-    total_params = 0
-    trainable_params = 0
-    
+    total_params, trainable_params = 0, 0
     for name, param in moe.named_parameters():
         total_params += param.numel()
         # Freeze everything by default
@@ -86,9 +97,7 @@ def main(args):
         if 'lora_' in name or 'fc' in name or 'classifier' in name or 'head' in name:
             param.requires_grad = True
             trainable_params += param.numel()
-            # logger.info(f"Unfreezing: {name}")
-
-    logger.info(f"Calibration complete. Trainable params: {trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)")
+    logger.info(f"Calibration params: {trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)")
 
     # --- 4. Load Data for Calibration ---
     logger.info("Loading calibration data (using training split)...")
@@ -118,16 +127,13 @@ def main(args):
         progress_bar = tqdm(train_loader, desc=f"Calibrating (LR={args.lr:.0e})")
         
         for images, targets in progress_bar:
-            images = images.to(device)
-            targets = targets.to(device)
-            
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             outputs = moe(images)
             loss = criterion(outputs, targets)
-            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
             progress_bar.set_postfix(loss=total_loss / (len(progress_bar)))
             
@@ -174,8 +180,7 @@ if __name__ == "__main__":
     parser.add_argument('--expert-model-size', type=str, default='small')
     parser.add_argument('--expert-use-lora', action='store_true')
     parser.add_argument('--expert-use-qlora', action='store_true')
-    
-    # Calibration params
+    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA (must match training)") # <-- NEW ARGUMENT
     parser.add_argument('--epochs', type=int, default=3, help="Number of calibration epochs (SHORT)")
     parser.add_argument('--batch-size', type=int, default=16, help="Batch size (use smaller for calibration)")
     parser.add_argument('--lr', type=float, default=1e-6, help="Learning rate (VERY LOW)")
