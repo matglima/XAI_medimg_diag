@@ -25,22 +25,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # This MUST match all other scripts
-PATHOLOGIES = [
-    'diabetes'
-    'diabetic_retinopathy'
-    'macular_edema'
-    'scar'
-    'nevus'
-    'amd'
-    'vascular_occlusion'
-    'hypertensive_retinopathy'
-    'drusens'
-    'hemorrhage'
-    'retinal_detachment'
-    'myopic_fundus'
-    'increased_cup_disc'
-    'other'
-]
+    PATHOLOGIES = [
+        'diabetes',
+        'diabetic_retinopathy',
+        'macular_edema',
+        'scar',
+        'nevus',
+        'amd',
+        'vascular_occlusion',
+        'hypertensive_retinopathy',
+        'drusens',
+        'hemorrhage',
+        'retinal_detachment',
+        'myopic_fundus',
+        'increased_cup_disc',
+        'other'
+    ]
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

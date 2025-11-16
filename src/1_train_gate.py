@@ -25,19 +25,19 @@ logger = logging.getLogger(__name__)
 
 # Define all pathologies (must match CSV headers)
 PATHOLOGIES = [
-    'diabetes'
-    'diabetic_retinopathy'
-    'macular_edema'
-    'scar'
-    'nevus'
-    'amd'
-    'vascular_occlusion'
-    'hypertensive_retinopathy'
-    'drusens'
-    'hemorrhage'
-    'retinal_detachment'
-    'myopic_fundus'
-    'increased_cup_disc'
+    'diabetes',
+    'diabetic_retinopathy',
+    'macular_edema',
+    'scar',
+    'nevus',
+    'amd',
+    'vascular_occlusion',
+    'hypertensive_retinopathy',
+    'drusens',
+    'hemorrhage',
+    'retinal_detachment',
+    'myopic_fundus',
+    'increased_cup_disc',
     'other'
 ]
 
