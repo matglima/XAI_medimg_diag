@@ -230,20 +230,17 @@ if __name__ == "__main__":
     # Training params
     parser.add_argument('--epochs', type=int, default=50, help="Max number of epochs")
     parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
-    parser.add.argument('--lr', type=float, default=1e-4, help="Learning rate")
-    parser.add.argument('--patience', type=int, default=5, help="Early stopping patience")
-    parser.add.argument('--num-workers', type=int, default=4, help="Dataloader workers")
+    
+    # --- START FIX: Corrected .add.argument to .add_argument ---
+    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate")
+    parser.add_argument('--patience', type=int, default=5, help="Early stopping patience")
+    parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
+    # --- END FIX ---
     
     # LoRA / Q-LoRA params
     parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
     parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
     
     args = parser.parse_args()
-    
-    # --- RECOMMENDATION ---
-    # Your batch size of 1024 was likely the main cause of the bottleneck.
-    # A smaller size like 64, 128, or 256 is recommended.
-    # The --batch-size default is now 32, but you passed 1024.
-    # Try a lower number in your run_full_pipeline.py script.
     
     main(args)
