@@ -1,9 +1,9 @@
 # -----------------------------------------------------------------
-# File: 3_calibrate_moe.py
+# File: src/3_calibrate_moe.py
 # -----------------------------------------------------------------
 # Description:
-# Phase 2B: Assembles and calibrates the MoE.
-# Refactored to PyTorch Lightning.
+# Phase 2B: Assembles the MoE and runs a brief, low-LR
+# fine-tuning (calibration) on the final layers.
 # -----------------------------------------------------------------
 
 import argparse
@@ -72,21 +72,25 @@ class CalibrationModule(pl.LightningModule):
         
         # --- 2. Load All Checkpoints ---
         logger.info("Loading pre-trained checkpoints...")
-        gate_ckpt_path = self.hparams.gate_ckpt_path
         
-        # --- Find the correct checkpoint file (robustly) ---
-        if self.hparams.gate_use_lora:
-            # Path is already the directory
-            pass
-        else:
-            # Find the .pth file in the directory
+        # --- START FIX: Correctly find gate checkpoint ---
+        gate_ckpt_path = self.hparams.gate_ckpt_path
+        if not self.hparams.gate_use_lora:
+            # If not using LoRA, find the .pth file
             try:
+                # Find the *first* file ending in .pth
                 gate_ckpt_file = [f for f in os.listdir(gate_ckpt_path) if f.endswith('.pth')][0]
                 gate_ckpt_path = os.path.join(gate_ckpt_path, gate_ckpt_file)
+                logger.info(f"Found full gate checkpoint: {gate_ckpt_path}")
             except IndexError:
-                logger.error(f"Could not find a .pth checkpoint in {gate_ckpt_path}")
-                raise
-        
+                logger.error(f"CRITICAL: --gate-use-lora=False, but no .pth file found in {gate_ckpt_path}")
+                # Re-raise the error so the script stops
+                raise FileNotFoundError(f"No .pth checkpoint found in {self.hparams.gate_ckpt_path}. Did training for Phase 1 fail or was it LoRA?")
+        else:
+            # If using LoRA, the path is just the directory
+            logger.info(f"Using LoRA adapters for gate from: {gate_ckpt_path}")
+        # --- END FIX ---
+            
         self.model.load_checkpoints(
             gate_ckpt_path=gate_ckpt_path,
             expert_ckpt_dir=self.hparams.expert_ckpt_dir,
@@ -146,7 +150,6 @@ class CalibrationModule(pl.LightningModule):
         return optimizer
 
     def _calculate_metrics(self, targets, preds):
-        # ... (same robust metrics function as 1_train_gate.py) ...
         preds_rounded = np.round(preds)
         auc_scores = []
         num_classes = targets.shape[1]
@@ -210,6 +213,7 @@ def main(args):
     ]
     
     mlflow_logger = None
+    checkpoint_callback = None # Initialize
     
     if args.use_mlflow:
         if not MLFLOW_AVAILABLE:
@@ -217,7 +221,6 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
-            # Autolog will handle checkpoints
             mlflow.pytorch.autolog(
                 log_models=True,
                 checkpoint=True,
@@ -236,7 +239,6 @@ def main(args):
             
     if not args.use_mlflow:
         logger.info("MLflow is disabled. Using local ModelCheckpoint.")
-        # Fallback to local checkpointing
         checkpoint_callback = ModelCheckpoint(
             dirpath=args.output_dir,
             filename='moe_calibrated_best',
@@ -264,20 +266,24 @@ def main(args):
     # --- 6. Save final merged model ---
     logger.info("Loading best model from checkpoint...")
     
-    # Find the best checkpoint path
     best_ckpt_path = ""
     if args.use_mlflow:
         # MLflow autolog saves checkpoints in a subdirectory
         ckpt_dir = os.path.join(args.output_dir, "checkpoints")
         best_ckpt_path = os.path.join(ckpt_dir, "moe_calibrated_best.ckpt")
     else:
-        best_ckpt_path = checkpoint_callback.best_model_path
+        # Ensure checkpoint_callback is not None
+        if checkpoint_callback:
+            best_ckpt_path = checkpoint_callback.best_model_path
+        else:
+            logger.error("Checkpoint callback was not initialized. Cannot find best model.")
+            best_ckpt_path = "" # Will cause fallback
 
     if not os.path.exists(best_ckpt_path):
         logger.warning(f"Could not find best checkpoint at {best_ckpt_path}. Saving last model state.")
-        # Fallback to saving the last model state
-        best_model = model
+        best_model = model # Fallback to saving the last model state
     else:
+        logger.info(f"Loading best model from: {best_ckpt_path}")
         best_model = CalibrationModule.load_from_checkpoint(best_ckpt_path)
     
     if args.gate_use_lora or args.expert_use_lora:
@@ -297,7 +303,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calibrate Hybrid MoE Model (Lightning)")
     
-    # Add all arguments
     parser.add_argument('--labels-path', type=str, required=True)
     parser.add_argument('--image-dir', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default="checkpoints/final_moe")
@@ -317,6 +322,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-6)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add-Adding --use-mlflow to notebook_args...
     parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
     
     args = parser.parse_args()
