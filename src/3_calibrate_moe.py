@@ -1,9 +1,9 @@
 # -----------------------------------------------------------------
-# File: src/3_calibrate_moe.py
+# File: 3_calibrate_moe.py
 # -----------------------------------------------------------------
 # Description:
-# Phase 2B: Assembles the MoE and runs a brief, low-LR
-# fine-tuning (calibration) on the final layers.
+# Phase 2B: Assembles and calibrates the MoE.
+# Refactored to PyTorch Lightning.
 # -----------------------------------------------------------------
 
 import argparse
@@ -150,6 +150,7 @@ class CalibrationModule(pl.LightningModule):
         return optimizer
 
     def _calculate_metrics(self, targets, preds):
+        # ... (same robust metrics function as 1_train_gate.py) ...
         preds_rounded = np.round(preds)
         auc_scores = []
         num_classes = targets.shape[1]
@@ -221,6 +222,7 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
+            # Autolog will handle checkpoints
             mlflow.pytorch.autolog(
                 log_models=True,
                 checkpoint=True,
@@ -239,6 +241,7 @@ def main(args):
             
     if not args.use_mlflow:
         logger.info("MLflow is disabled. Using local ModelCheckpoint.")
+        # Fallback to local checkpointing
         checkpoint_callback = ModelCheckpoint(
             dirpath=args.output_dir,
             filename='moe_calibrated_best',
@@ -281,7 +284,8 @@ def main(args):
 
     if not os.path.exists(best_ckpt_path):
         logger.warning(f"Could not find best checkpoint at {best_ckpt_path}. Saving last model state.")
-        best_model = model # Fallback to saving the last model state
+        # Fallback to saving the last model state
+        best_model = model
     else:
         logger.info(f"Loading best model from: {best_ckpt_path}")
         best_model = CalibrationModule.load_from_checkpoint(best_ckpt_path)
@@ -303,6 +307,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Calibrate Hybrid MoE Model (Lightning)")
     
+    # Add all arguments
     parser.add_argument('--labels-path', type=str, required=True)
     parser.add_argument('--image-dir', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default="checkpoints/final_moe")
@@ -322,7 +327,6 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-6)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add-Adding --use-mlflow to notebook_args...
     parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
     
     args = parser.parse_args()
