@@ -73,7 +73,6 @@ class CalibrationModule(pl.LightningModule):
         # --- 2. Load All Checkpoints ---
         logger.info("Loading pre-trained checkpoints...")
         
-        # --- START FIX: Correctly find gate checkpoint ---
         gate_ckpt_path = self.hparams.gate_ckpt_path
         if not self.hparams.gate_use_lora:
             # If not using LoRA, find the .pth file
@@ -89,7 +88,9 @@ class CalibrationModule(pl.LightningModule):
         else:
             # If using LoRA, the path is just the directory
             logger.info(f"Using LoRA adapters for gate from: {gate_ckpt_path}")
-        # --- END FIX ---
+            # --- FIX: Resolve to absolute path to prevent Hub lookup ---
+            gate_ckpt_path = os.path.abspath(gate_ckpt_path)
+
             
         self.model.load_checkpoints(
             gate_ckpt_path=gate_ckpt_path,
