@@ -2,8 +2,8 @@
 # File: 3_calibrate_moe.py
 # -----------------------------------------------------------------
 # Description:
-# Phase 2B: Assembles the MoE and runs a brief, low-LR
-# fine-tuning (calibration) on the final layers.
+# Phase 2B: Assembles and calibrates the MoE.
+# Refactored to PyTorch Lightning.
 # -----------------------------------------------------------------
 
 import argparse
@@ -18,148 +18,306 @@ from tqdm import tqdm
 import os
 import warnings
 
-from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform
+# --- Lightning Imports ---
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+# --- End Lightning Imports ---
+
+# --- MLflow Autolog ---
+try:
+    import mlflow
+    import mlflow.pytorch
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("Warning: 'mlflow' package not found. MLflow logging will be disabled.")
+
+from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from moe_model import HybridMoE
 from models import get_optimizer
-from config import BRSET_LABELS # <-- NEW IMPORT
+from config import BRSET_LABELS
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Main Calibration Function ---
+# --- PyTorch Lightning Module ---
+
+class CalibrationModule(pl.LightningModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        self.PATHOLOGIES = BRSET_LABELS
+        
+        # --- Define Model Configurations ---
+        gate_config = {
+            'model_name': self.hparams.gate_model_name,
+            'model_size': self.hparams.gate_model_size,
+            'use_lora': self.hparams.gate_use_lora,
+            'use_qlora': self.hparams.gate_use_qlora,
+            'lora_r': self.hparams.lora_r
+        }
+        expert_config = {
+            'model_name': self.hparams.expert_model_name,
+            'model_size': self.hparams.expert_model_size,
+            'use_lora': self.hparams.expert_use_lora,
+            'use_qlora': self.hparams.expert_use_qlora,
+            'lora_r': self.hparams.lora_r
+        }
+
+        # --- 1. Initialize MoE Structure ---
+        logger.info("Initializing HybridMoE structure...")
+        # We must use self.device *after* it's assigned by Lightning
+        self.model = HybridMoE(gate_config, expert_config, self.PATHOLOGIES, 'cpu')
+        
+        # --- 2. Load All Checkpoints ---
+        logger.info("Loading pre-trained checkpoints...")
+        gate_ckpt_path = self.hparams.gate_ckpt_path
+        
+        # --- Find the correct checkpoint file (robustly) ---
+        if self.hparams.gate_use_lora:
+            # Path is already the directory
+            pass
+        else:
+            # Find the .pth file in the directory
+            try:
+                gate_ckpt_file = [f for f in os.listdir(gate_ckpt_path) if f.endswith('.pth')][0]
+                gate_ckpt_path = os.path.join(gate_ckpt_path, gate_ckpt_file)
+            except IndexError:
+                logger.error(f"Could not find a .pth checkpoint in {gate_ckpt_path}")
+                raise
+        
+        self.model.load_checkpoints(
+            gate_ckpt_path=gate_ckpt_path,
+            expert_ckpt_dir=self.hparams.expert_ckpt_dir,
+            gate_is_lora=self.hparams.gate_use_lora,
+            expert_is_lora=self.hparams.expert_use_lora
+        )
+        
+        # --- 3. Freeze Parameters for Calibration ---
+        logger.info("Freezing model parameters for calibration...")
+        total_params, trainable_params = 0, 0
+        for name, param in self.model.named_parameters():
+            total_params += param.numel()
+            param.requires_grad = False
+            if 'lora_' in name or 'fc' in name or 'classifier' in name or 'head' in name:
+                param.requires_grad = True
+                trainable_params += param.numel()
+        logger.info(f"Calibration params: {trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)")
+
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.validation_step_outputs = []
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = self.criterion(outputs, targets)
+        self.log('cal_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = self.criterion(outputs, targets)
+        self.log('cal_val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        
+        preds = torch.sigmoid(outputs)
+        self.validation_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
+        return loss
+
+    def on_validation_epoch_end(self):
+        preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).numpy()
+        targets = torch.cat([x['targets'] for x in self.validation_step_outputs]).numpy()
+        
+        metrics = self._calculate_metrics(targets, preds)
+        
+        self.log('cal_val_auc_macro', metrics['auc_macro'], prog_bar=True)
+        self.log('cal_val_f1_macro', metrics['f1_macro'])
+        
+        self.validation_step_outputs.clear()
+
+    def configure_optimizers(self):
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        use_qlora = self.hparams.gate_use_qlora or self.hparams.expert_use_qlora
+        optimizer = get_optimizer(trainable_params, self.hparams.lr, use_qlora)
+        return optimizer
+
+    def _calculate_metrics(self, targets, preds):
+        # ... (same robust metrics function as 1_train_gate.py) ...
+        preds_rounded = np.round(preds)
+        auc_scores = []
+        num_classes = targets.shape[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for i in range(num_classes):
+                try:
+                    if len(np.unique(targets[:, i])) > 1:
+                        auc_scores.append(roc_auc_score(targets[:, i], preds[:, i]))
+                    else:
+                        auc_scores.append(0.5) 
+                except ValueError:
+                    auc_scores.append(0.5)
+        auc_macro = np.nanmean(auc_scores)
+        f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
+        return {'f1_macro': f1_macro, 'auc_macro': auc_macro}
+
+# --- DataModule for Lightning ---
+
+class CalibrationDataModule(pl.LightningDataModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        self.PATHOLOGIES = BRSET_LABELS
+        self.labels_df = pd.read_csv(self.hparams.labels_path)
+        self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
+        self.splits = get_random_splits(self.labels_df, test_size=0.2, val_size=0.1)
+
+    def setup(self, stage=None):
+        self.train_dataset = MultiLabelRetinaDataset(
+            self.labels_df, self.hparams.image_dir, self.PATHOLOGIES, train_transform, self.splits['train']
+        )
+        self.val_dataset = MultiLabelRetinaDataset(
+            self.labels_df, self.hparams.image_dir, self.PATHOLOGIES, val_transform, self.splits['val']
+        )
+        
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+# --- Main execution ---
+
 def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+    # --- 1. Init Data ---
+    dm = CalibrationDataModule(args)
     
-    # --- DYNAMICALLY LOAD PATHOLOGIES ---
-    PATHOLOGIES = BRSET_LABELS
+    # --- 2. Init Model ---
+    model = CalibrationModule(args)
     
-    # --- Define Model Configurations ---
-    # These MUST match the configs used for training
-    gate_config = {
-        'model_name': args.gate_model_name,
-        'model_size': args.gate_model_size,
-        'use_lora': args.gate_use_lora,
-        'use_qlora': args.gate_use_qlora,
-        'lora_r': args.lora_r
-    }
-    expert_config = {
-        'model_name': args.expert_model_name,
-        'model_size': args.expert_model_size,
-        'use_lora': args.expert_use_lora,
-        'use_qlora': args.expert_use_qlora,
-        'lora_r': args.lora_r
-    }
-
-    # --- 1. Initialize MoE Structure ---
-    logger.info("Initializing HybridMoE structure...")
-    moe = HybridMoE(gate_config, expert_config, PATHOLOGIES, device) # <-- Pass dynamic list
+    # --- 3. Init Loggers and Callbacks ---
+    callbacks = [
+        TQDMProgressBar(refresh_rate=10)
+    ]
     
-    # --- 2. Load All Checkpoints ---
-    logger.info("Loading pre-trained checkpoints...")
-    # Adjust path for full models
-    gate_ckpt_path = args.gate_ckpt_path
-    if not args.gate_use_lora:
-        gate_ckpt_path = os.path.join(args.gate_ckpt_path, "gate_best_model.pth")
-        
-    moe.load_checkpoints(
-        gate_ckpt_path=gate_ckpt_path,
-        expert_ckpt_dir=args.expert_ckpt_dir,
-        gate_is_lora=args.gate_use_lora,
-        expert_is_lora=args.expert_use_lora
-    )
+    mlflow_logger = None
     
-    # --- 3. Freeze Parameters for Calibration ---
-    logger.info("Freezing model parameters for calibration...")
-    total_params, trainable_params = 0, 0
-    for name, param in moe.named_parameters():
-        total_params += param.numel()
-        # Freeze everything by default
-        param.requires_grad = False
-        
-        # Unfreeze ONLY LoRA adapters and final classifier layers
-        # This is the key to calibration: don't destroy pre-trained features.
-        if 'lora_' in name or 'fc' in name or 'classifier' in name or 'head' in name:
-            param.requires_grad = True
-            trainable_params += param.numel()
-    logger.info(f"Calibration params: {trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)")
-
-    # --- 4. Load Data for Calibration ---
-    logger.info("Loading calibration data (using training split)...")
-    labels_df = pd.read_csv(args.labels_path)
-    labels_df['image_id'] = labels_df['image_id'].astype(str)
-    splits = get_random_splits(labels_df) # Use same splits as gate
-    
-    train_dataset = MultiLabelRetinaDataset(
-        labels_df, args.image_dir, PATHOLOGIES, train_transform, splits['train']
-    )
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, 
-        num_workers=args.num_workers, pin_memory=True
-    )
-    logger.info(f"Calibration samples: {len(train_dataset)}")
-
-    # --- 5. Run Calibration Loop ---
-    criterion = nn.BCEWithLogitsLoss()
-    # Use the correct optimizer (8-bit if any component used Q-LoRA)
-    use_qlora = args.gate_use_qlora or args.expert_use_qlora
-    optimizer = get_optimizer(moe, args.lr, use_qlora)
-    
-    moe.train()
-    for epoch in range(args.epochs):
-        logger.info(f"\n--- Calibration Epoch {epoch+1}/{args.epochs} ---")
-        total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f"Calibrating (LR={args.lr:.0e})")
-        
-        for images, targets in progress_bar:
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            outputs = moe(images)
-            loss = criterion(outputs, targets)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            progress_bar.set_postfix(loss=total_loss / (len(progress_bar)))
+    if args.use_mlflow:
+        if not MLFLOW_AVAILABLE:
+            logger.error("MLflow is not installed. Disabling MLflow logging.")
+            args.use_mlflow = False
+        else:
+            logger.info("Enabling MLflow autologging...")
+            # Autolog will handle checkpoints
+            mlflow.pytorch.autolog(
+                log_models=True,
+                checkpoint=True,
+                checkpoint_monitor='cal_val_auc_macro',
+                checkpoint_mode='max',
+                checkpoint_save_best_only=True,
+                checkpoint_save_freq='epoch',
+                checkpoint_dirpath=args.output_dir,
+                checkpoint_filename='moe_calibrated_best'
+            )
+            mlflow_logger = MLflowLogger(
+                experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
+                run_name=args.run_name,
+                tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
+            )
             
-    # --- 6. Save Final Calibrated Model ---
-    os.makedirs(args.output_dir, exist_ok=True)
-    save_path = os.path.join(args.output_dir, "moe_calibrated_final.pth")
+    if not args.use_mlflow:
+        logger.info("MLflow is disabled. Using local ModelCheckpoint.")
+        # Fallback to local checkpointing
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=args.output_dir,
+            filename='moe_calibrated_best',
+            monitor='cal_val_auc_macro',
+            mode='max',
+            save_top_k=1,
+        )
+        callbacks.append(checkpoint_callback)
+
+    # --- 4. Init Trainer ---
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1,
+        logger=mlflow_logger if args.use_mlflow else False,
+        callbacks=callbacks
+    )
     
-    logger.info("Saving calibrated model state dict (with adapters)...")
-    torch.save(moe.state_dict(), save_path)
+    # --- 5. Run Training ---
+    logger.info("--- Starting MoE Calibration ---")
+    trainer.fit(model, datamodule=dm)
     
-    logger.info(f"Final calibrated model saved to {save_path}")
+    logger.info("--- MoE Calibration Complete ---")
+    
+    # --- 6. Save final merged model ---
+    logger.info("Loading best model from checkpoint...")
+    
+    # Find the best checkpoint path
+    best_ckpt_path = ""
+    if args.use_mlflow:
+        # MLflow autolog saves checkpoints in a subdirectory
+        ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+        best_ckpt_path = os.path.join(ckpt_dir, "moe_calibrated_best.ckpt")
+    else:
+        best_ckpt_path = checkpoint_callback.best_model_path
+
+    if not os.path.exists(best_ckpt_path):
+        logger.warning(f"Could not find best checkpoint at {best_ckpt_path}. Saving last model state.")
+        # Fallback to saving the last model state
+        best_model = model
+    else:
+        best_model = CalibrationModule.load_from_checkpoint(best_ckpt_path)
+    
+    if args.gate_use_lora or args.expert_use_lora:
+        logger.info("Merging LoRA adapters into base model for final saving...")
+        if hasattr(best_model.model.gate, 'model') and hasattr(best_model.model.gate.model, 'merge_and_unload'):
+            best_model.model.gate.model = best_model.model.gate.model.merge_and_unload()
+        for expert in best_model.model.experts:
+            if hasattr(expert, 'model') and hasattr(expert.model, 'merge_and_unload'):
+                expert.model = expert.model.merge_and_unload()
+        logger.info("Adapters merged.")
+    
+    # Save the final, merged state_dict
+    final_save_path = os.path.join(args.output_dir, "moe_calibrated_final.pth")
+    torch.save(best_model.model.state_dict(), final_save_path)
+    logger.info(f"Final merged model saved to {final_save_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calibrate Hybrid MoE Model")
+    parser = argparse.ArgumentParser(description="Calibrate Hybrid MoE Model (Lightning)")
     
-    # Data params
-    parser.add_argument('--labels-path', type=str, required=True, help="Path to labels.csv")
-    parser.add_argument('--image-dir', type=str, required=True, help="Directory with fundus images")
-    parser.add_argument('--output-dir', type=str, default="checkpoints/final_moe", help="Directory to save final model")
-    
-    # Checkpoint paths
-    parser.add_argument('--gate-ckpt-path', type=str, default="checkpoints/gate", help="Path to gate checkpoint (dir if LoRA, full file path if full model)")
-    parser.add_argument('--expert-ckpt-dir', type=str, default="checkpoints/experts", help="Directory containing all expert checkpoints")
-
-    # Gate Config (must match 1_train_gate.py)
+    # Add all arguments
+    parser.add_argument('--labels-path', type=str, required=True)
+    parser.add_argument('--image-dir', type=str, required=True)
+    parser.add_argument('--output-dir', type=str, default="checkpoints/final_moe")
+    parser.add_argument('--run-name', type=str, default="Calibration_Run")
+    parser.add_argument('--gate-ckpt-path', type=str, required=True)
+    parser.add_argument('--expert-ckpt-dir', type=str, required=True)
     parser.add_argument('--gate-model-name', type=str, default='resnet')
     parser.add_argument('--gate-model-size', type=str, default='small')
     parser.add_argument('--gate-use-lora', action='store_true')
     parser.add_argument('--gate-use-qlora', action='store_true')
-
-    # Expert Config (must match 2_train_experts.py)
     parser.add_argument('--expert-model-name', type=str, default='resnet')
     parser.add_argument('--expert-model-size', type=str, default='small')
     parser.add_argument('--expert-use-lora', action='store_true')
     parser.add_argument('--expert-use-qlora', action='store_true')
-    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA (must match training)")
-    parser.add_argument('--epochs', type=int, default=3, help="Number of calibration epochs (SHORT)")
-    parser.add_argument('--batch-size', type=int, default=16, help="Batch size (use smaller for calibration)")
-    parser.add_argument('--lr', type=float, default=1e-6, help="Learning rate (VERY LOW)")
-    parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
+    parser.add_argument('--lora-r', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=1e-6)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
     
     args = parser.parse_args()
     main(args)

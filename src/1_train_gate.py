@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------
 # Description:
 # Phase 1A: Trains the Multi-Label "Gate" model.
-# Now dynamically loads pathology list.
+# Refactored to PyTorch Lightning for clean logging and MLflow.
 # -----------------------------------------------------------------
 
 import argparse
@@ -13,196 +13,296 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
-from tqdm import tqdm
-import os
+from sklearn.metrics import f1_score, roc_auc_score
 import warnings
+import os
+
+# --- Lightning Imports ---
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+# --- End Lightning Imports ---
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
 from models import create_model, get_optimizer
-from config import BRSET_LABELS # <-- NEW IMPORT
+from config import BRSET_LABELS
+
+# --- MLflow Autolog ---
+# We try to import mlflow. If it fails, we set a flag.
+try:
+    import mlflow
+    import mlflow.pytorch
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("Warning: 'mlflow' package not found. MLflow logging will be disabled.")
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Helper Functions ---
+# --- PyTorch Lightning Module ---
 
-def run_epoch(model, loader, criterion, optimizer, device, is_training):
-    model.train() if is_training else model.eval()
-    total_loss = 0
-    all_preds, all_targets = [], []
-    progress_bar = tqdm(loader, desc="Training" if is_training else "Validation")
-    
-    for images, targets in progress_bar:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        with torch.set_grad_enabled(is_training):
-            outputs = model(images)
-            loss = criterion(outputs, targets)
-            if is_training:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-        total_loss += loss.item()
-        all_preds.append(torch.sigmoid(outputs).detach().cpu().numpy())
-        all_targets.append(targets.cpu().numpy())
-        progress_bar.set_postfix(loss=total_loss / (len(all_preds)))
+class GateModule(pl.LightningModule):
+    def __init__(self, hparams):
+        """
+        hparams is a Namespace object from argparse
+        """
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        self.pathologies = BRSET_LABELS
         
-    avg_loss = total_loss / len(loader)
-    all_preds = np.concatenate(all_preds, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
-    return avg_loss, all_preds, all_targets
+        self.model = create_model(
+            model_name=self.hparams.model_name,
+            model_size=self.hparams.model_size,
+            pretrained=not self.hparams.no_pretrained,
+            num_classes=len(self.pathologies),
+            use_lora=self.hparams.use_lora,
+            use_qlora=self.hparams.use_qlora,
+            lora_r=self.hparams.lora_r
+        )
+        
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.validation_step_outputs = []
+        self.test_step_outputs = []
 
-def get_metrics(targets, preds):
-    # Calculate metrics for multi-label classification
-    preds_rounded = np.round(preds)
-    auc_scores = []
-    num_classes = targets.shape[1]
-    
-    # Suppress warnings for classes with only one label
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for i in range(num_classes):
-            try:
-                # Check if both classes are present
-                if len(np.unique(targets[:, i])) > 1:
-                    auc_scores.append(roc_auc_score(targets[:, i], preds[:, i]))
-                else:
-                    # Only one class present, append 0.5 (neutral) or np.nan
-                    auc_scores.append(0.5) 
-            except ValueError:
-                auc_scores.append(0.5)
-    auc_macro = np.nanmean(auc_scores)
-    f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
-    acc = accuracy_score(targets, preds_rounded) # This is subset accuracy (very strict)
-    
-    return {'f1_macro': f1_macro, 'auc_macro': auc_macro, 'accuracy': acc}
+    def forward(self, x):
+        return self.model(x)
 
-# --- Main Training Function ---
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = self.criterion(outputs, targets)
+        
+        # self.log() is automatically captured by autolog()
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = self.criterion(outputs, targets)
+        
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        
+        preds = torch.sigmoid(outputs)
+        self.validation_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
+        return loss
+
+    def on_validation_epoch_end(self):
+        preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).numpy()
+        targets = torch.cat([x['targets'] for x in self.validation_step_outputs]).numpy()
+        
+        metrics = self._calculate_metrics(targets, preds)
+        
+        # Log val_auc_macro, which will be used for checkpointing
+        self.log('val_auc_macro', metrics['auc_macro'], prog_bar=True)
+        self.log('val_f1_macro', metrics['f1_macro'])
+        
+        self.validation_step_outputs.clear()
+
+    def test_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = self.criterion(outputs, targets)
+        
+        self.log('test_loss', loss, on_epoch=True)
+        preds = torch.sigmoid(outputs)
+        self.test_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
+
+    def on_test_epoch_end(self):
+        preds = torch.cat([x['preds'] for x in self.test_step_outputs]).numpy()
+        targets = torch.cat([x['targets'] for x in self.test_step_outputs]).numpy()
+        
+        metrics = self._calculate_metrics(targets, preds)
+        
+        # Log final test metrics
+        self.log('test_auc_macro', metrics['auc_macro'])
+        self.log('test_f1_macro', metrics['f1_macro'])
+        
+        print(f"\n--- Gate Test Metrics ---")
+        print(f"Test AUC (Macro): {metrics['auc_macro']:.4f}")
+        print(f"Test F1 (Macro):  {metrics['f1_macro']:.4f}")
+        
+        # This is optional, but good for MLflow: log test metrics manually
+        # as autolog might not capture this print statement.
+        if self.hparams.use_mlflow and MLFLOW_AVAILABLE:
+            mlflow.log_metrics({
+                'test_auc_macro': metrics['auc_macro'],
+                'test_f1_macro': metrics['f1_macro']
+            })
+
+        self.test_step_outputs.clear()
+
+    def configure_optimizers(self):
+        optimizer = get_optimizer(self.model, self.hparams.lr, self.hparams.use_qlora)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.1)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_auc_macro",
+                "mode": "max"
+            },
+        }
+
+    def _calculate_metrics(self, targets, preds):
+        # ... (same robust metrics function as before) ...
+        preds_rounded = np.round(preds)
+        auc_scores = []
+        num_classes = targets.shape[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for i in range(num_classes):
+                try:
+                    if len(np.unique(targets[:, i])) > 1:
+                        auc_scores.append(roc_auc_score(targets[:, i], preds[:, i]))
+                    else:
+                        auc_scores.append(0.5) 
+                except ValueError:
+                    auc_scores.append(0.5)
+        auc_macro = np.nanmean(auc_scores)
+        f1_macro = f1_score(targets, preds_rounded, average='macro', zero_division=0)
+        return {'f1_macro': f1_macro, 'auc_macro': auc_macro}
+
+# --- DataModule for Lightning ---
+
+class GateDataModule(pl.LightningDataModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        self.PATHOLOGIES = BRSET_LABELS
+        self.labels_df = pd.read_csv(self.hparams.labels_path)
+        self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
+        self.splits = get_random_splits(self.labels_df, test_size=0.2, val_size=0.1)
+
+    def setup(self, stage=None):
+        if stage == 'fit' or stage is None:
+            self.train_dataset = MultiLabelRetinaDataset(
+                self.labels_df, self.hparams.image_dir, self.PATHOLOGIES, train_transform, self.splits['train']
+            )
+            self.val_dataset = MultiLabelRetinaDataset(
+                self.labels_df, self.hparams.image_dir, self.PATHOLOGIES, val_transform, self.splits['val']
+            )
+        if stage == 'test' or stage is None:
+            self.test_dataset = MultiLabelRetinaDataset(
+                self.labels_df, self.hparams.image_dir, self.PATHOLOGIES, val_transform, self.splits['test']
+            )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+# --- Main execution ---
 
 def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
+    # --- 1. Init Data ---
+    dm = GateDataModule(args)
     
-    # --- DYNAMICALLY LOAD PATHOLOGIES ---
-    PATHOLOGIES = BRSET_LABELS
+    # --- 2. Init Model ---
+    model = GateModule(args)
     
-    logger.info("Loading labels...")
-    labels_df = pd.read_csv(args.labels_path)
-    labels_df['image_id'] = labels_df['image_id'].astype(str)
+    # --- 3. Init Loggers and Callbacks ---
+    callbacks = [
+        EarlyStopping(monitor='val_auc_macro', patience=args.patience, mode='max', verbose=True),
+        TQDMProgressBar(refresh_rate=10)
+    ]
     
-    # Use random splits for multi-label
-    logger.info("Creating random splits...")
-    splits = get_random_splits(labels_df, test_size=0.2, val_size=0.1)
+    mlflow_logger = None
     
-    # Note: The transforms are now passed from the global scope
-    # The Dataset will pre-cache using pre_transform
-    # and apply train_transform/val_transform on-the-fly
-    train_dataset = MultiLabelRetinaDataset(
-        labels_df, args.image_dir, PATHOLOGIES, train_transform, splits['train']
-    )
-    val_dataset = MultiLabelRetinaDataset(
-        labels_df, args.image_dir, PATHOLOGIES, val_transform, splits['val']
-    )
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, 
-        num_workers=args.num_workers, pin_memory=True # pin_memory=True is important
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, 
-        num_workers=args.num_workers, pin_memory=True
-    )
-    
-    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-
-    # --- Initialize Model ---
-    logger.info(f"Creating model: {args.model_name} {args.model_size}")
-    model = create_model(
-        model_name=args.model_name,
-        model_size=args.model_size,
-        pretrained=not args.no_pretrained,
-        num_classes=len(PATHOLOGIES), # <-- Dynamic
-        use_lora=args.use_lora,
-        use_qlora=args.use_qlora,
-        lora_r=args.lora_r # <-- Pass lora_r
-    ).to(device)
-
-    # --- Loss and Optimizer ---
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = get_optimizer(model, args.lr, args.use_qlora)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.1)
-
-    # --- Training Loop ---
-    best_val_auc = 0
-    epochs_no_improve = 0
-    os.makedirs(args.output_dir, exist_ok=True)
-    model_save_path = os.path.join(args.output_dir, "gate_best_model.pth")
-    lora_save_path = args.output_dir # save_pretrained saves to a directory
-
-    for epoch in range(args.epochs):
-        logger.info(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
-        
-        train_loss, train_preds, train_targets = run_epoch(
-            model, train_loader, criterion, optimizer, device, is_training=True
-        )
-        train_metrics = get_metrics(train_targets, train_preds)
-        logger.info(f"Train Loss: {train_loss:.4f} | Train AUC: {train_metrics['auc_macro']:.4f} | Train F1: {train_metrics['f1_macro']:.4f}")
-
-        val_loss, val_preds, val_targets = run_epoch(
-            model, val_loader, criterion, None, device, is_training=False
-        )
-        val_metrics = get_metrics(val_targets, val_preds)
-        logger.info(f"Val Loss: {val_loss:.4f} | Val AUC: {val_metrics['auc_macro']:.4f} | Val F1: {val_metrics['f1_macro']:.4f}")
-        
-        scheduler.step(val_metrics['auc_macro'])
-        
-        if val_metrics['auc_macro'] > best_val_auc:
-            logger.info(f"Val AUC improved ({best_val_auc:.4f} --> {val_metrics['auc_macro']:.4f}). Saving model...")
-            best_val_auc = val_metrics['auc_macro']
-            if args.use_lora:
-                model.model.save_pretrained(lora_save_path) # <-- Use correct path
-            else:
-                # Save the full model
-                torch.save(model.state_dict(), model_save_path)
-            epochs_no_improve = 0
+    if args.use_mlflow:
+        if not MLFLOW_AVAILABLE:
+            logger.error("MLflow is not installed. Disabling MLflow logging.")
+            args.use_mlflow = False
         else:
-            epochs_no_improve += 1
-            logger.info(f"Val AUC did not improve. Counter: {epochs_no_improve}/{args.patience}")
+            logger.info("Enabling MLflow autologging...")
+            # MLflow Autolog will handle logging, params, and checkpoints
+            mlflow.pytorch.autolog(
+                log_models=True,
+                checkpoint=True,
+                checkpoint_monitor='val_auc_macro',
+                checkpoint_mode='max',
+                checkpoint_save_best_only=True,
+                checkpoint_save_freq='epoch',
+                # This ensures the checkpoint is saved in the *correct* dir
+                # so the rest of the pipeline can find it.
+                checkpoint_dirpath=args.output_dir, 
+                checkpoint_filename='gate_best_model' # This will be the name
+            )
+            # We still create a logger to pass to the Trainer
+            mlflow_logger = MLflowLogger(
+                experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
+                run_name=args.run_name,
+                tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
+            )
+    
+    if not args.use_mlflow:
+        logger.info("MLflow is disabled. Using local ModelCheckpoint.")
+        # Fallback to local checkpointing if MLflow is off
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=args.output_dir,
+            filename='gate_best_model', # Fixed name for the pipeline
+            monitor='val_auc_macro',
+            mode='max',
+            save_top_k=1,
+        )
+        callbacks.append(checkpoint_callback)
 
-        if epochs_no_improve >= args.patience:
-            logger.info("Early stopping triggered.")
-            break
-            
-    logger.info(f"Training complete. Best Val AUC: {best_val_auc:.4f}")
-    if args.use_lora:
-        logger.info(f"Best LoRA adapters saved in: {lora_save_path}")
-    else:
-        logger.info(f"Best model saved to: {model_save_path}")
+    # --- 4. Init Trainer ---
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1,
+        logger=mlflow_logger if args.use_mlflow else False, # Disable logger if not using MLflow
+        callbacks=callbacks,
+        log_every_n_steps=10
+    )
+    
+    # --- 5. Run Training ---
+    logger.info("--- Starting Gate Model Training ---")
+    trainer.fit(model, datamodule=dm)
+    
+    # --- 6. Run Testing ---
+    logger.info("--- Starting Gate Model Testing ---")
+    # 'ckpt_path="best"' automatically loads the best model
+    trainer.test(datamodule=dm, ckpt_path='best')
+    
+    logger.info("--- Gate Model Training & Testing Complete ---")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Multi-Label Gate Model")
+    parser = argparse.ArgumentParser(description="Train Multi-Label Gate Model (Lightning)")
     
-    # Data params
-    parser.add_argument('--labels-path', type=str, required=True, help="Path to labels.csv")
-    parser.add_argument('--image-dir', type=str, required=True, help="Directory with fundus images")
-    parser.add_argument('--output-dir', type=str, default="checkpoints/gate", help="Directory to save checkpoints")
-    
-    # Model params
-    parser.add_argument('--model-name', type=str, default='resnet', choices=['convnext', 'efficientnet', 'vit', 'swin', 'resnet'])
-    parser.add_argument('--model-size', type=str, default='small', help="e.g., 'small', 'base', 'large'")
-    parser.add_argument('--no-pretrained', action='store_true', help="Do not use pretrained weights")
-
-    # Training params
-    parser.add_argument('--epochs', type=int, default=50, help="Max number of epochs")
-    parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
-    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate")
-    parser.add_argument('--patience', type=int, default=5, help="Early stopping patience")
-    parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
-    parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
-    parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
-    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA")
+    # Add all arguments
+    parser.add_argument('--labels-path', type=str, required=True)
+    parser.add_argument('--image-dir', type=str, required=True)
+    parser.add_argument('--output-dir', type=str, default="checkpoints/gate")
+    parser.add_argument('--run-name', type=str, default="Gate_Model_Run")
+    parser.add_argument('--model-name', type=str, default='resnet')
+    parser.add_argument('--model-size', type=str, default='small')
+    parser.add_argument('--no-pretrained', action='store_true')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--use-lora', action='store_true')
+    parser.add_argument('--use-qlora', action='store_true')
+    parser.add_argument('--lora-r', type=int, default=16)
+    parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
     
     args = parser.parse_args()
     main(args)

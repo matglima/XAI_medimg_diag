@@ -3,6 +3,7 @@
 # -----------------------------------------------------------------
 # Description:
 # Phase 1B: Trains the 14 Binary "Expert" models.
+# Refactored to PyTorch Lightning for clean logging and MLflow.
 # -----------------------------------------------------------------
 
 import argparse
@@ -13,9 +14,22 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score
-from tqdm import tqdm
-import os
 import warnings
+import os
+
+# --- Lightning Imports ---
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+# --- End Lightning Imports ---
+
+# --- MLflow Autolog ---
+try:
+    import mlflow
+    import mlflow.pytorch
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("Warning: 'mlflow' package not found. MLflow logging will be disabled.")
 
 from dataloader import RetinaDataset, get_stratified_splits, train_transform, val_transform
 from models import create_model, get_optimizer
@@ -41,172 +55,248 @@ class FocalLoss(nn.Module):
         elif self.reduction == 'sum': return focal_loss.sum()
         return focal_loss
 
-# --- Main Trainer Class ---
+# --- PyTorch Lightning Module ---
 
-class ExpertTrainer:
-    def __init__(self, args):
-        self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.target_label = args.target_label
+class ExpertModule(pl.LightningModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.save_hyperparameters(hparams)
         
-        os.makedirs(args.output_dir, exist_ok=True)
-        self.model_save_path = os.path.join(args.output_dir, f"{self.target_label}_best_model.pth")
-        self.lora_save_path = os.path.join(args.output_dir, f"{self.target_label}_lora_adapters")
-        
-        logger.info(f"--- Training Expert for: {self.target_label} ---")
-        logger.info(f"Using device: {self.device}")
-
-        # --- Load Data ---
-        logger.info("Loading labels...")
-        labels_df = pd.read_csv(args.labels_path)
-        labels_df['image_id'] = labels_df['image_id'].astype(str)
-        
-        logger.info("Creating stratified splits...")
-        splits = get_stratified_splits(labels_df, self.target_label)
-        
-        # Dataloader will now load from the pre-built cache
-        train_dataset = RetinaDataset(
-            labels_df, args.image_dir, self.target_label, train_transform, splits['train']
-        )
-        val_dataset = RetinaDataset(
-            labels_df, args.image_dir, self.target_label, val_transform, splits['val']
-        )
-        
-        self.train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True, 
-            num_workers=args.num_workers, pin_memory=True
-        )
-        self.val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False, 
-            num_workers=args.num_workers, pin_memory=True
-        )
-        
-        logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-
-        # --- Initialize Model ---
-        logger.info(f"Creating model: {args.model_name} {args.model_size}")
         self.model = create_model(
-            model_name=args.model_name,
-            model_size=args.model_size,
-            pretrained=not args.no_pretrained,
-            num_classes=1, # Binary expert
-            use_lora=args.use_lora,
-            use_qlora=args.use_qlora,
-            lora_r=args.lora_r # <-- Pass lora_r
-        ).to(self.device)
-
-        # --- Loss and Optimizer ---
-        self.criterion = FocalLoss(alpha=args.alpha, gamma=args.gamma)
-        self.optimizer = get_optimizer(self.model, args.lr, args.use_qlora)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'max', patience=3, factor=0.1)
-
-    def _run_epoch(self, loader, is_training):
-        self.model.train() if is_training else self.model.eval()
-        total_loss = 0
-        all_preds, all_targets = [], []
-        progress_bar = tqdm(loader, desc=f"Training {self.target_label}" if is_training else f"Validation {self.target_label}")
+            model_name=self.hparams.model_name,
+            model_size=self.hparams.model_size,
+            pretrained=not self.hparams.no_pretrained,
+            num_classes=1, # Binary
+            use_lora=self.hparams.use_lora,
+            use_qlora=self.hparams.use_qlora,
+            lora_r=self.hparams.lora_r
+        )
         
-        for images, targets in progress_bar:
-            images = images.to(self.device)
-            targets = targets.to(self.device).squeeze() # Ensure 1D
+        self.criterion = FocalLoss(alpha=self.hparams.alpha, gamma=self.hparams.gamma)
+        self.validation_step_outputs = []
+        self.test_step_outputs = []
 
-            with torch.set_grad_enabled(is_training):
-                outputs = self.model(images).squeeze() # Output shape (batch_size)
-                loss = self.criterion(outputs, targets)
-                if is_training:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-            total_loss += loss.item()
-            all_preds.append(torch.sigmoid(outputs).detach().cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
-            progress_bar.set_postfix(loss=total_loss / (len(all_preds)))
-            
-        avg_loss = total_loss / len(loader)
-        all_preds = np.concatenate(all_preds, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        return avg_loss, all_preds, all_targets
+    def forward(self, x):
+        return self.model(x)
 
-    def train(self):
-        best_val_auc = 0
-        epochs_no_improve = 0
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images).squeeze()
+        loss = self.criterion(outputs, targets.squeeze())
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images).squeeze()
+        loss = self.criterion(outputs, targets.squeeze())
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         
-        for epoch in range(self.args.epochs):
-            logger.info(f"\n--- Epoch {epoch+1}/{self.args.epochs} ---")
-            
-            train_loss, train_preds, train_targets = self._run_epoch(self.train_loader, is_training=True)
-            
-            # --- Robust Metrics for Binary ---
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    train_auc = roc_auc_score(train_targets, train_preds)
-                except ValueError:
-                    train_auc = 0.5
-                train_f1 = f1_score(train_targets, np.round(train_preds), zero_division=0)
-            logger.info(f"Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f} | Train F1: {train_f1:.4f}")
+        preds = torch.sigmoid(outputs)
+        self.validation_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
+        return loss
 
-            val_loss, val_preds, val_targets = self._run_epoch(self.val_loader, is_training=False)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    val_auc = roc_auc_score(val_targets, val_preds)
-                except ValueError:
-                    val_auc = 0.5
-                val_f1 = f1_score(val_targets, np.round(val_preds), zero_division=0)
-            logger.info(f"Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Val F1: {val_f1:.4f}")
-            
-            self.scheduler.step(val_auc)
-            
-            # --- Save Best Model (based on Val AUC) ---
-            if val_auc > best_val_auc:
-                logger.info(f"Val AUC improved ({best_val_auc:.4f} --> {val_auc:.4f}). Saving model...")
-                best_val_auc = val_auc
-                if self.args.use_lora:
-                    self.model.model.save_pretrained(self.lora_save_path)
-                else:
-                    torch.save(self.model.state_dict(), self.model_save_path)
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                logger.info(f"Val AUC did not improve. Counter: {epochs_no_improve}/{self.args.patience}")
+    def on_validation_epoch_end(self):
+        preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).numpy()
+        targets = torch.cat([x['targets'] for x in self.validation_step_outputs]).numpy()
+        
+        metrics = self._calculate_metrics(targets, preds)
+        
+        self.log('val_auc', metrics['auc'], prog_bar=True)
+        self.log('val_f1', metrics['f1'])
+        
+        self.validation_step_outputs.clear()
 
-            if epochs_no_improve >= self.args.patience:
-                logger.info("Early stopping triggered.")
-                break
-                
-        logger.info(f"Training complete for {self.target_label}. Best Val AUC: {best_val_auc:.4f}")
+    def test_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images).squeeze()
+        loss = self.criterion(outputs, targets.squeeze())
+        
+        self.log('test_loss', loss, on_epoch=True)
+        preds = torch.sigmoid(outputs)
+        self.test_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
+
+    def on_test_epoch_end(self):
+        preds = torch.cat([x['preds'] for x in self.test_step_outputs]).numpy()
+        targets = torch.cat([x['targets'] for x in self.test_step_outputs]).numpy()
+        
+        metrics = self._calculate_metrics(targets, preds)
+        
+        self.log('test_auc', metrics['auc'])
+        self.log('test_f1', metrics['f1'])
+
+        print(f"\n--- Expert '{self.hparams.target_label}' Test Metrics ---")
+        print(f"Test AUC: {metrics['auc']:.4f}")
+        print(f"Test F1:  {metrics['f1']:.4f}")
+
+        if self.hparams.use_mlflow and MLFLOW_AVAILABLE:
+            mlflow.log_metrics({
+                'test_auc': metrics['auc'],
+                'test_f1': metrics['f1']
+            })
+
+        self.test_step_outputs.clear()
+
+    def configure_optimizers(self):
+        optimizer = get_optimizer(self.model, self.hparams.lr, self.hparams.use_qlora)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.1)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_auc",
+                "mode": "max"
+            },
+        }
+
+    def _calculate_metrics(self, targets, preds):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                auc = roc_auc_score(targets, preds)
+            except ValueError:
+                auc = 0.5
+            f1 = f1_score(targets, np.round(preds), zero_division=0)
+        return {'f1': f1, 'auc': auc}
+
+# --- DataModule for Lightning ---
+
+class ExpertDataModule(pl.LightningDataModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        self.labels_df = pd.read_csv(self.hparams.labels_path)
+        self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
+        self.splits = get_stratified_splits(self.labels_df, self.hparams.target_label)
+
+    def setup(self, stage=None):
+        if stage == 'fit' or stage is None:
+            self.train_dataset = RetinaDataset(
+                self.labels_df, self.hparams.image_dir, self.hparams.target_label, train_transform, self.splits['train']
+            )
+            self.val_dataset = RetinaDataset(
+                self.labels_df, self.hparams.image_dir, self.hparams.target_label, val_transform, self.splits['val']
+            )
+        if stage == 'test' or stage is None:
+            self.test_dataset = RetinaDataset(
+                self.labels_df, self.hparams.image_dir, self.hparams.target_label, val_transform, self.splits['test']
+            )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
+            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+        )
+
+# --- Main execution ---
+
+def main(args):
+    # --- 1. Init Data ---
+    dm = ExpertDataModule(args)
+    
+    # --- 2. Init Model ---
+    model = ExpertModule(args)
+    
+    # --- 3. Init Loggers and Callbacks ---
+    callbacks = [
+        EarlyStopping(monitor='val_auc', patience=args.patience, mode='max', verbose=True),
+        TQDMProgressBar(refresh_rate=10)
+    ]
+    
+    mlflow_logger = None
+    
+    if args.use_mlflow:
+        if not MLFLOW_AVAILABLE:
+            logger.error("MLflow is not installed. Disabling MLflow logging.")
+            args.use_mlflow = False
+        else:
+            logger.info("Enabling MLflow autologging...")
+            # MLflow Autolog will handle logging, params, and checkpoints
+            mlflow.pytorch.autolog(
+                log_models=True,
+                checkpoint=True,
+                checkpoint_monitor='val_auc', # Monitor val_auc for experts
+                checkpoint_mode='max',
+                checkpoint_save_best_only=True,
+                checkpoint_save_freq='epoch',
+                # Save to a *sub-directory* named after the expert
+                checkpoint_dirpath=os.path.join(args.output_dir, f"{args.target_label}_checkpoints"),
+                checkpoint_filename=f'{args.target_label}_best_model'
+            )
+            # We use a nested run for better organization
+            mlf_logger = MLflowLogger(
+                experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
+                run_name=args.run_name,
+                tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
+            )
+
+    if not args.use_mlflow:
+        logger.info("MLflow is disabled. Using local ModelCheckpoint.")
+        # Fallback to local checkpointing if MLflow is off
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=args.output_dir, # Save directly to the expert dir
+            filename=f'{args.target_label}_best_model',
+            monitor='val_auc',
+            mode='max',
+            save_top_k=1,
+        )
+        callbacks.append(checkpoint_callback)
+
+    # --- 4. Init Trainer ---
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1,
+        logger=mlflow_logger if args.use_mlflow else False,
+        callbacks=callbacks,
+        log_every_n_steps=10
+    )
+    
+    # --- 5. Run Training ---
+    logger.info(f"--- Starting Expert Training for: {args.target_label} ---")
+    trainer.fit(model, datamodule=dm)
+    
+    # --- 6. Run Testing ---
+    logger.info(f"--- Starting Expert Testing for: {args.target_label} ---")
+    trainer.test(datamodule=dm, ckpt_path='best')
+    
+    logger.info(f"--- Expert Training & Testing Complete for: {args.target_label} ---")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Binary Expert Model")
+    parser = argparse.ArgumentParser(description="Train Binary Expert Model (Lightning)")
     
-    # Data params
-    parser.add_argument('--labels-path', type=str, required=True, help="Path to labels.csv")
-    parser.add_argument('--image-dir', type=str, required=True, help="Directory with fundus images")
-    parser.add_argument('--target-label', type=str, required=True, help="Specific pathology to train expert for")
-    parser.add_argument('--output-dir', type=str, default="checkpoints/experts", help="Directory to save checkpoints")
-    
-    # Model params
-    parser.add_argument('--model-name', type=str, default='resnet', choices=['convnext', 'efficientnet', 'vit', 'swin', 'resnet'])
-    parser.add_argument('--model-size', type=str, default='small', help="e.g., 'small', 'base', 'large'")
-    parser.add_argument('--no-pretrained', action='store_true', help="Do not use pretrained weights")
-
-    # Training params
-    parser.add_argument('--epochs', type=int, default=50, help="Max number of epochs")
-    parser.add_argument('--batch-size', type=int, default=32, help="Batch size")
-    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate")
-    parser.add_argument('--patience', type=int, default=5, help="Early stopping patience")
-    parser.add_argument('--num-workers', type=int, default=4, help="Dataloader workers")
-    
-    # Loss params
-    parser.add_argument('--alpha', type=float, default=0.25, help='Alpha parameter for focal loss')
-    parser.add_argument('--gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
-    
-    # LoRA / Q-LoRA params
-    parser.add_argument('--use-lora', action='store_true', help="Enable LoRA fine-tuning")
-    parser.add_argument('--use-qlora', action='store_true', help="Enable Q-LoRA (4-bit) fine-tuning")
-    parser.add_argument('--lora-r', type=int, default=16, help="Rank for LoRA") # <-- NEW ARGUMENT
+    # Add all arguments
+    parser.add_argument('--labels-path', type=str, required=True)
+    parser.add_argument('--image-dir', type=str, required=True)
+    parser.add_argument('--target-label', type=str, required=True)
+    parser.add_argument('--output-dir', type=str, default="checkpoints/experts")
+    parser.add_argument('--run-name', type=str, default="Expert_Run")
+    parser.add_argument('--model-name', type=str, default='resnet')
+    parser.add_argument('--model-size', type=str, default='small')
+    parser.add_argument('--no-pretrained', action='store_true')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--alpha', type=float, default=0.25)
+    parser.add_argument('--gamma', type=float, default=2.0)
+    parser.add_argument('--use-lora', action='store_true')
+    parser.add_argument('--use-qlora', action='store_true')
+    parser.add_argument('--lora-r', type=int, default=16)
+    parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
     
     args = parser.parse_args()
-    trainer = ExpertTrainer(args)
-    trainer.train()
+    main(args)
