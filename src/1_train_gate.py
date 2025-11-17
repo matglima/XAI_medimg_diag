@@ -20,6 +20,7 @@ import os
 # --- Lightning Imports ---
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+from pytorch_lightning.loggers import MLflowLogger
 # --- End Lightning Imports ---
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
@@ -27,7 +28,6 @@ from models import create_model, get_optimizer
 from config import BRSET_LABELS
 
 # --- MLflow Autolog ---
-# We try to import mlflow. If it fails, we set a flag.
 try:
     import mlflow
     import mlflow.pytorch
@@ -73,7 +73,6 @@ class GateModule(pl.LightningModule):
         outputs = self(images)
         loss = self.criterion(outputs, targets)
         
-        # self.log() is automatically captured by autolog()
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
 
@@ -89,6 +88,8 @@ class GateModule(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
+        if not self.validation_step_outputs:
+            return
         preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).numpy()
         targets = torch.cat([x['targets'] for x in self.validation_step_outputs]).numpy()
         
@@ -110,12 +111,13 @@ class GateModule(pl.LightningModule):
         self.test_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
 
     def on_test_epoch_end(self):
+        if not self.test_step_outputs:
+            return
         preds = torch.cat([x['preds'] for x in self.test_step_outputs]).numpy()
         targets = torch.cat([x['targets'] for x in self.test_step_outputs]).numpy()
         
         metrics = self._calculate_metrics(targets, preds)
         
-        # Log final test metrics
         self.log('test_auc_macro', metrics['auc_macro'])
         self.log('test_f1_macro', metrics['f1_macro'])
         
@@ -146,7 +148,6 @@ class GateModule(pl.LightningModule):
         }
 
     def _calculate_metrics(self, targets, preds):
-        # ... (same robust metrics function as before) ...
         preds_rounded = np.round(preds)
         auc_scores = []
         num_classes = targets.shape[1]
@@ -216,10 +217,21 @@ def main(args):
     model = GateModule(args)
     
     # --- 3. Init Loggers and Callbacks ---
+    
+    # --- START FIX: Always use ModelCheckpoint to find the best .ckpt ---
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.output_dir,
+        filename='gate_best_model', # Fixed name for the pipeline
+        monitor='val_auc_macro',
+        mode='max',
+        save_top_k=1,
+    )
     callbacks = [
         EarlyStopping(monitor='val_auc_macro', patience=args.patience, mode='max', verbose=True),
-        TQDMProgressBar(refresh_rate=10)
+        TQDMProgressBar(refresh_rate=10),
+        checkpoint_callback # Always add the callback
     ]
+    # --- END FIX ---
     
     mlflow_logger = None
     
@@ -229,20 +241,24 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
-            # MLflow Autolog will handle logging, params, and checkpoints
+            # --- START FIX: Disable MLflow's checkpointing ---
+            # We use Lightning's checkpointing to find the best .ckpt
+            # and then save the final model format manually.
             mlflow.pytorch.autolog(
-                log_models=True,
-                checkpoint=True,
-                checkpoint_monitor='val_auc_macro',
-                checkpoint_mode='max',
-                checkpoint_save_best_only=True,
-                checkpoint_save_freq='epoch',
-                # This ensures the checkpoint is saved in the *correct* dir
-                # so the rest of the pipeline can find it.
-                checkpoint_dirpath=args.output_dir, 
-                checkpoint_filename='gate_best_model' # This will be the name
+                log_models=False, # Disable auto-logging models
+                checkpoint=False, # Disable auto-checkpointing
+                disable=True      # Disable complex autologging
             )
-            # We still create a logger to pass to the Trainer
+            # Re-enable simple metric logging
+            mlflow.pytorch.autolog(
+                log_models=False,
+                log_datasets=False,
+                log_input_examples=False,
+                log_loss_metrics=True,
+                log_opt_hyperparams=True
+            )
+            # --- END FIX ---
+            
             mlflow_logger = MLflowLogger(
                 experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
                 run_name=args.run_name,
@@ -251,15 +267,8 @@ def main(args):
     
     if not args.use_mlflow:
         logger.info("MLflow is disabled. Using local ModelCheckpoint.")
-        # Fallback to local checkpointing if MLflow is off
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=args.output_dir,
-            filename='gate_best_model', # Fixed name for the pipeline
-            monitor='val_auc_macro',
-            mode='max',
-            save_top_k=1,
-        )
-        callbacks.append(checkpoint_callback)
+        # This is now handled above by default
+        pass
 
     # --- 4. Init Trainer ---
     trainer = pl.Trainer(
@@ -277,16 +286,48 @@ def main(args):
     
     # --- 6. Run Testing ---
     logger.info("--- Starting Gate Model Testing ---")
-    # 'ckpt_path="best"' automatically loads the best model
     trainer.test(datamodule=dm, ckpt_path='best')
     
     logger.info("--- Gate Model Training & Testing Complete ---")
+
+    # --- START FIX: Save final model in the correct format for the pipeline ---
+    logger.info("Saving final model in pipeline-compatible format...")
+    
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
+        logger.error("Could not find best checkpoint path. Saving from last model state.")
+        # Fallback to the model object in memory
+        best_model_to_save = model.model
+    else:
+        logger.info(f"Loading best model from: {best_ckpt_path}")
+        best_model_to_save = GateModule.load_from_checkpoint(best_ckpt_path).model
+
+    if args.use_lora or args.use_qlora:
+        # Save as PEFT adapters
+        logger.info(f"Saving LoRA adapters to: {args.output_dir}")
+        best_model_to_save.save_pretrained(args.output_dir)
+        if args.use_mlflow:
+            mlflow.log_artifact(args.output_dir, artifact_path="gate_adapters")
+    else:
+        # Save as raw .pth state_dict
+        final_save_path = os.path.join(args.output_dir, "gate_best_model.pth")
+        logger.info(f"Saving full model state_dict to: {final_save_path}")
+        torch.save(best_model_to_save.state_dict(), final_save_path)
+        if args.use_mlflow:
+            mlflow.log_artifact(final_save_path, artifact_path="gate_model")
+            
+    # Clean up the .ckpt file to save space
+    if os.path.exists(best_ckpt_path):
+        logger.info(f"Cleaning up temporary checkpoint: {best_ckpt_path}")
+        os.remove(best_ckpt_path)
+            
+    logger.info("Final model saved successfully.")
+    # --- END FIX ---
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Multi-Label Gate Model (Lightning)")
     
-    # Add all arguments
     parser.add_argument('--labels-path', type=str, required=True)
     parser.add_argument('--image-dir', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default="checkpoints/gate")

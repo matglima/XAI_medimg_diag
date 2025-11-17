@@ -20,6 +20,7 @@ import os
 # --- Lightning Imports ---
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+from pytorch_lightning.loggers import MLflowLogger
 # --- End Lightning Imports ---
 
 # --- MLflow Autolog ---
@@ -97,6 +98,8 @@ class ExpertModule(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
+        if not self.validation_step_outputs:
+            return
         preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).numpy()
         targets = torch.cat([x['targets'] for x in self.validation_step_outputs]).numpy()
         
@@ -117,6 +120,8 @@ class ExpertModule(pl.LightningModule):
         self.test_step_outputs.append({'preds': preds.detach().cpu(), 'targets': targets.detach().cpu()})
 
     def on_test_epoch_end(self):
+        if not self.test_step_outputs:
+            return
         preds = torch.cat([x['preds'] for x in self.test_step_outputs]).numpy()
         targets = torch.cat([x['targets'] for x in self.test_step_outputs]).numpy()
         
@@ -210,10 +215,22 @@ def main(args):
     model = ExpertModule(args)
     
     # --- 3. Init Loggers and Callbacks ---
+    
+    # --- START FIX: Always use ModelCheckpoint to find the best .ckpt ---
+    # We save the .ckpt file flat in the expert dir
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.output_dir, # Save directly to the expert dir
+        filename=f'{args.target_label}_best_model',
+        monitor='val_auc',
+        mode='max',
+        save_top_k=1,
+    )
     callbacks = [
         EarlyStopping(monitor='val_auc', patience=args.patience, mode='max', verbose=True),
-        TQDMProgressBar(refresh_rate=10)
+        TQDMProgressBar(refresh_rate=10),
+        checkpoint_callback # Always add the callback
     ]
+    # --- END FIX ---
     
     mlflow_logger = None
     
@@ -223,17 +240,19 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
-            # MLflow Autolog will handle logging, params, and checkpoints
+            # --- START FIX: Disable MLflow's checkpointing ---
             mlflow.pytorch.autolog(
-                log_models=True,
-                checkpoint=True,
-                checkpoint_monitor='val_auc', # Monitor val_auc for experts
-                checkpoint_mode='max',
-                checkpoint_save_best_only=True,
-                checkpoint_save_freq='epoch',
-                # Save to a *sub-directory* named after the expert
-                checkpoint_dirpath=os.path.join(args.output_dir, f"{args.target_label}_checkpoints"),
-                checkpoint_filename=f'{args.target_label}_best_model'
+                log_models=False, # Disable auto-logging models
+                checkpoint=False, # Disable auto-checkpointing
+                disable=True      # Disable complex autologging
+            )
+            # Re-enable simple metric logging
+            mlflow.pytorch.autolog(
+                log_models=False,
+                log_datasets=False,
+                log_input_examples=False,
+                log_loss_metrics=True,
+                log_opt_hyperparams=True
             )
             # We use a nested run for better organization
             mlf_logger = MLflowLogger(
@@ -244,15 +263,8 @@ def main(args):
 
     if not args.use_mlflow:
         logger.info("MLflow is disabled. Using local ModelCheckpoint.")
-        # Fallback to local checkpointing if MLflow is off
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=args.output_dir, # Save directly to the expert dir
-            filename=f'{args.target_label}_best_model',
-            monitor='val_auc',
-            mode='max',
-            save_top_k=1,
-        )
-        callbacks.append(checkpoint_callback)
+        # This is now handled above
+        pass
 
     # --- 4. Init Trainer ---
     trainer = pl.Trainer(
@@ -274,10 +286,44 @@ def main(args):
     
     logger.info(f"--- Expert Training & Testing Complete for: {args.target_label} ---")
 
+    # --- START FIX: Save final model in the correct format ---
+    logger.info(f"Saving final expert model for {args.target_label}...")
+    
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if not best_ckpt_path or not os.path.exists(best_ckpt_path):
+        logger.error("Could not find best checkpoint path. Saving from last model state.")
+        best_model_to_save = model.model
+    else:
+        logger.info(f"Loading best model from: {best_ckpt_path}")
+        best_model_to_save = ExpertModule.load_from_checkpoint(best_ckpt_path).model
+
+    if args.use_lora or args.use_qlora:
+        # Save as PEFT adapters in a subdirectory named after the label
+        final_save_dir = os.path.join(args.output_dir, args.target_label)
+        os.makedirs(final_save_dir, exist_ok=True)
+        logger.info(f"Saving LoRA adapters to: {final_save_dir}")
+        best_model_to_save.save_pretrained(final_save_dir)
+        if args.use_mlflow:
+            mlflow.log_artifact(final_save_dir, artifact_path=f"{args.target_label}_adapters")
+    else:
+        # Save as raw .pth state_dict named after the label
+        final_save_path = os.path.join(args.output_dir, f"{args.target_label}.pth")
+        logger.info(f"Saving full model state_dict to: {final_save_path}")
+        torch.save(best_model_to_save.state_dict(), final_save_path)
+        if args.use_mlflow:
+            mlflow.log_artifact(final_save_path, artifact_path=f"{args.target_label}_model")
+            
+    # Clean up the .ckpt file to save space
+    if os.path.exists(best_ckpt_path):
+        logger.info(f"Cleaning up temporary checkpoint: {best_ckpt_path}")
+        os.remove(best_ckpt_path)
+            
+    logger.info(f"Final expert model for {args.target_label} saved.")
+    # --- END FIX ---
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Binary Expert Model (Lightning)")
     
-    # Add all arguments
     parser.add_argument('--labels-path', type=str, required=True)
     parser.add_argument('--image-dir', type=str, required=True)
     parser.add_argument('--target-label', type=str, required=True)
