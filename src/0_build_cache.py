@@ -82,13 +82,17 @@ def main(args):
     num_workers = os.cpu_count() or 4 # Get all CPU cores
     logger.info(f"Building image cache using {num_workers} threads...")
 
+    # --- START FIX: Use submit and as_completed for a clean tqdm bar ---
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        results = list(tqdm(executor.map(_load_and_resize_image, tasks), total=len(tasks)))
-
-    # Process results and filter out failed images
-    for image_id, image in results:
-        if image is not None:
-            cached_images_dict[image_id] = image
+        # Submit all tasks to the executor
+        futures = {executor.submit(_load_and_resize_image, task): task for task in tasks}
+        
+        # Wrap as_completed in tqdm to track progress as tasks finish
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Building Cache"):
+            image_id, image = future.result()
+            if image is not None:
+                cached_images_dict[image_id] = image
+    # --- END FIX ---
             
     logger.info(f"Successfully loaded {len(cached_images_dict)} / {len(image_ids)} images.")
     
@@ -100,5 +104,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build Image Cache")
     parser.add_argument('--labels-path', type=str, required=True, help="Path to labels.csv")
     parser.add_argument('--image-dir', type=str, required=True, help="Directory with fundus images")
-    args = parser.parse_args()
-    main(args)
+
+    args, _ = parser.parse_known_args()
+    if args.labels_path and args.image_dir:
+        main(args)
+    else:
+        print("Note: This script is intended to be run from the pipeline. Skipping cache build.")
