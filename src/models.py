@@ -4,15 +4,18 @@
 # Description:
 # Defines the ModelWrapper. This is the core model creation factory,
 # now with support for num_classes, LoRA, Q-LoRA, and custom lora_r.
+# compatible with ResNet, EfficientNet, ConvNeXt, ViT, and Swin.
 # -----------------------------------------------------------------
 
 import torch
 import torch.nn as nn
 from torchvision import models
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 # --- LoRA / Q-LoRA Imports ---
-# Make sure to install: pip install peft bitsandbytes accelerate
 try:
     from peft import get_peft_model, LoraConfig, TaskType
     from bitsandbytes.optim import AdamW8bit
@@ -32,7 +35,7 @@ class ModelWrapper(nn.Module):
                  num_classes: int = 1,
                  use_lora: bool = False,
                  use_qlora: bool = False,
-                 lora_r: int = 16): # <-- NEW ARGUMENT
+                 lora_r: int = 16): 
         """
         Wrapper to create a model with optional LoRA/Q-LoRA.
 
@@ -57,7 +60,7 @@ class ModelWrapper(nn.Module):
         self.num_classes = num_classes
         self.use_lora = use_lora
         self.use_qlora = use_qlora
-        self.lora_r = lora_r # <-- SAVE ARGUMENT
+        self.lora_r = lora_r 
 
         # Create base model with new weights API
         self.model = self._create_model(pretrained)
@@ -100,26 +103,58 @@ class ModelWrapper(nn.Module):
         return model_config[self.model_name][self.model_size]
 
     def _modify_head(self, model):
-        """Modify the model's final layer for num_classes"""
-        in_features = None
-        
-        if hasattr(model, 'fc'): # ResNet
+        """
+        Modify the model's final layer for num_classes.
+        Handles unwrapping Sequentials for PEFT compatibility.
+        """
+        # --- 1. ResNet ---
+        if hasattr(model, 'fc'):
             in_features = model.fc.in_features
             model.fc = nn.Linear(in_features, self.num_classes)
             
-        elif self.model_name == 'convnext': # ConvNeXt has a different structure
-            in_features = model.classifier[-1].in_features
-            model.classifier[-1] = nn.Linear(in_features, self.num_classes)
+        # --- 2. ConvNeXt ---
+        elif self.model_name == 'convnext': 
+            # ConvNeXt classifier is Sequential(LayerNorm, Flatten, Linear).
+            # We MUST keep the LayerNorm, so we only modify the internal Linear layer.
+            # The internal linear layer is usually at index 2.
+            in_features = model.classifier[2].in_features
+            model.classifier[2] = nn.Linear(in_features, self.num_classes)
             
-        elif hasattr(model, 'classifier'): # EfficientNet
-            in_features = model.classifier[-1].in_features
-            model.classifier[-1] = nn.Linear(in_features, self.num_classes)
+        # --- 3. EfficientNet ---
+        elif hasattr(model, 'classifier'): 
+            # EfficientNet classifier is Sequential(Dropout, Linear).
+            # To avoid "Target module Sequential not supported", we unwrap it.
+            if isinstance(model.classifier, nn.Sequential):
+                in_features = model.classifier[-1].in_features
+            elif isinstance(model.classifier, nn.Linear):
+                in_features = model.classifier.in_features
+            else:
+                in_features = 1280 # Fallback
             
-        elif hasattr(model, 'heads'): # ViT
-            in_features = model.heads.head.in_features
-            model.heads.head = nn.Linear(in_features, self.num_classes)
+            # Replace the Sequential block with a single Linear layer
+            model.classifier = nn.Linear(in_features, self.num_classes)
             
-        elif hasattr(model, 'head'): # Swin
+        # --- 4. ViT ---
+        elif hasattr(model, 'heads'): 
+            # ViT uses 'heads' which is Sequential(OrderedDict([('head', Linear)])).
+            # We unwrap this to be direct for PEFT simplicity.
+            if isinstance(model.heads, nn.Sequential):
+                # Access the linear layer inside
+                for module in model.heads.modules():
+                    if isinstance(module, nn.Linear):
+                        in_features = module.in_features
+                        break
+            else:
+                in_features = model.heads.head.in_features
+            
+            # Replace 'heads' with a single Linear layer if possible, 
+            # or replace the internal 'head' if the structure forces it.
+            # Torchvision ViT forward pass calls self.heads(x). 
+            # We can replace self.heads with a Linear layer safely.
+            model.heads = nn.Linear(in_features, self.num_classes)
+            
+        # --- 5. Swin ---
+        elif hasattr(model, 'head'): 
             in_features = model.head.in_features
             model.head = nn.Linear(in_features, self.num_classes)
             
@@ -132,13 +167,9 @@ class ModelWrapper(nn.Module):
         weights = 'DEFAULT' if pretrained else None
         model_fn = self._get_model_fn()
         
-        # Prepare kwargs for the model constructor
-        model_kwargs = {
-            'weights': weights
-        }
+        model_kwargs = {'weights': weights}
 
         if self.use_qlora:
-            # Only add quantization_config if it's actually being used
             quantization_config = bnb.BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
@@ -147,27 +178,49 @@ class ModelWrapper(nn.Module):
             )
             model_kwargs['quantization_config'] = quantization_config
 
-        # Load the base model
+        # Load base model
         model = model_fn(**model_kwargs)
         
-        # Modify the head BEFORE applying LoRA
+        # Modify head BEFORE applying LoRA
         self._modify_head(model)
         
         if self.use_lora:
-            # Find all linear layers to target for LoRA
-            target_modules = []
-            for name, module in model.named_modules():
-                if isinstance(module, (nn.Linear, bnb.nn.Linear4bit)):
-                    module_name = name.split('.')[-1]
-                    if module_name not in target_modules:
-                         target_modules.append(module_name)
+            # --- Dynamic LoRA Targeting ---
+            # Instead of a hardcoded list that might hit a Sequential block,
+            # we scan the model and find the actual Linear modules.
             
-            target_modules = ['query', 'key', 'value', 'fc', 'fc1', 'fc2', 'head', 'classifier']
+            # Keywords to look for in layer names
+            target_keywords = ['query', 'key', 'value', 'fc', 'head', 'classifier', 'downsample', 'project', 'expand']
+            actual_targets = []
+
+            for name, module in model.named_modules():
+                # Only target Linear layers (and 4bit Linear)
+                if isinstance(module, (nn.Linear, bnb.nn.Linear4bit)):
+                    # Check if the name looks like a target
+                    if any(k in name for k in target_keywords):
+                        # We found a target.
+                        # If it's inside a Sequential (like ConvNeXt 'classifier.2'),
+                        # name will be 'classifier.2'. PEFT handles this correctly.
+                        # We extract the suffix to be safe/clean.
+                        
+                        suffix = name.split('.')[-1]
+                        # If the suffix is just a number (like in Sequential), we might need the full path or parent
+                        if suffix.isdigit():
+                            # Use the full name (e.g. classifier.2)
+                            actual_targets.append(name)
+                        else:
+                            # Use the suffix (e.g. fc, head)
+                            actual_targets.append(suffix)
+
+            # Deduplicate
+            actual_targets = list(set(actual_targets))
+            
+            print(f"Auto-detected LoRA Target Modules: {actual_targets}")
 
             lora_config = LoraConfig(
-                r=self.lora_r, # <-- USE lora_r
-                lora_alpha=self.lora_r * 2, # Alpha is often 2*r
-                target_modules=target_modules,
+                r=self.lora_r, 
+                lora_alpha=self.lora_r * 2, 
+                target_modules=actual_targets,
                 lora_dropout=0.1,
                 bias="none",
             )
@@ -183,10 +236,7 @@ class ModelWrapper(nn.Module):
 
 
 def create_model(model_name, model_size='base', pretrained=True, num_classes=1, 
-                 use_lora=False, use_qlora=False, lora_r=16): # <-- NEW ARGUMENT
-    """
-    Factory function to create the ModelWrapper.
-    """
+                 use_lora=False, use_qlora=False, lora_r=16): 
     return ModelWrapper(
         model_name=model_name,
         model_size=model_size,
@@ -194,7 +244,7 @@ def create_model(model_name, model_size='base', pretrained=True, num_classes=1,
         num_classes=num_classes,
         use_lora=use_lora,
         use_qlora=use_qlora,
-        lora_r=lora_r # <-- PASS ARGUMENT
+        lora_r=lora_r 
     )
 
 def get_optimizer(model, lr, use_qlora=False):
