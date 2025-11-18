@@ -21,7 +21,7 @@ import warnings
 # --- Lightning Imports ---
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
-from lightning.pytorch.loggers import MLflowLogger
+from lightning.pytorch.loggers import MLFlowLogger
 # --- End Lightning Imports ---
 
 # --- MLflow Autolog ---

@@ -20,7 +20,7 @@ import os
 # --- Lightning Imports ---
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
-from lightning.pytorch.loggers import MLflowLogger
+from lightning.pytorch.loggers import MLFlowLogger
 # --- End Lightning Imports ---
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
@@ -259,7 +259,7 @@ def main(args):
             )
             # --- END FIX ---
             
-            mlflow_logger = MLflowLogger(
+            mlflow_logger = MLFlowLogger(
                 experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
                 run_name=args.run_name,
                 tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')

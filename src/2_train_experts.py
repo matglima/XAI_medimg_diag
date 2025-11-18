@@ -20,7 +20,7 @@ import os
 # --- Lightning Imports ---
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
-from lightning.pytorch.loggers import MLflowLogger
+from lightning.pytorch.loggers import MLFlowLogger
 # --- End Lightning Imports ---
 
 # --- MLflow Autolog ---
@@ -255,7 +255,7 @@ def main(args):
                 log_opt_hyperparams=True
             )
             # We use a nested run for better organization
-            mlf_logger = MLflowLogger(
+            mlf_logger = MLFlowLogger(
                 experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
                 run_name=args.run_name,
                 tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
