@@ -18,9 +18,9 @@ import warnings
 import os
 
 # --- Lightning Imports ---
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
-from pytorch_lightning.loggers import MLflowLogger
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
+from lightning.pytorch.loggers import MLflowLogger
 # --- End Lightning Imports ---
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform

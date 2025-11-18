@@ -19,9 +19,9 @@ import os
 import warnings
 
 # --- Lightning Imports ---
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
-from pytorch_lightning.loggers import MLflowLogger
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.loggers import MLflowLogger
 # --- End Lightning Imports ---
 
 # --- MLflow Autolog ---
