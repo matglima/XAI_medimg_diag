@@ -6,7 +6,7 @@ data/*
 # Model files
 *.pth
 *.pt
-
+*.ckpt
 # Images
 *.png
 *.jpg

@@ -1,0 +1,14 @@
+torch
+optuna
+torchcam
+peft
+bitsandbytes
+accelerate
+lightning
+mlflow
+torchvision
+pillow
+pandas
+scikit-learn
+numpy
+torchcam
