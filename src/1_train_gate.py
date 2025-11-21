@@ -192,7 +192,8 @@ class GateDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=0, pin_memory=False, persistent_workers=False
+            # num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
         )
 
     def val_dataloader(self):
@@ -253,9 +254,7 @@ def main(args):
             mlflow.pytorch.autolog(
                 log_models=False,
                 log_datasets=False,
-                log_input_examples=False,
-                log_loss_metrics=True,
-                log_opt_hyperparams=True
+                registered_model_name=args.run_name,
             )
             # --- END FIX ---
             
@@ -275,6 +274,7 @@ def main(args):
         max_epochs=args.epochs,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
+        # strategy='fsdp',
         logger=mlflow_logger if args.use_mlflow else False, # Disable logger if not using MLflow
         callbacks=callbacks,
         log_every_n_steps=10
@@ -301,7 +301,10 @@ def main(args):
     else:
         logger.info(f"Loading best model from: {best_ckpt_path}")
         best_model_to_save = GateModule.load_from_checkpoint(best_ckpt_path).model
-
+    
+    if hasattr(best_model_to_save, 'model'):
+        best_model_to_save = best_model_to_save.model
+        
     if args.use_lora or args.use_qlora:
         # Save as PEFT adapters
         logger.info(f"Saving LoRA adapters to: {args.output_dir}")

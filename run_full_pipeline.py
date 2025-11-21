@@ -7,6 +7,29 @@ from datetime import datetime
 # If not, you may need to define BRSET_LABELS manually, e.g.:
 # BRSET_LABELS = ['DME', 'DR', 'ARMD', 'MH', 'DN', 'MYA', 'BRVO', 'TSLN', 'ERM', 'LS', 'MS', 'CSR', 'ODC', 'CRVO', 'TV', 'AH', 'ODP', 'ODE', 'ST', 'AION', 'PT', 'RT', 'RS', 'CRS', 'EDN', 'RPEC', 'MHL', 'RP', 'CWS', 'CB', 'ODPM', 'PRH', 'MRH', 'MNF', 'HR', 'CRAO', 'TD', 'CME', 'PTCA', 'BPR', 'OS', 'SCH', 'SD']
 from src.config import BRSET_LABELS
+import pandas as pd
+############################################# fix brset labels for diabetes ###########################
+# --- Settings ---
+FILE_IN = 'data/labels_brset.csv'
+FILE_OUT = 'data/labels_brset_new.csv'
+COLUMN = 'diabetes'
+# ----------------
+
+# 1. Read the CSV
+df = pd.read_csv(FILE_IN)
+
+# 2. Map 'yes' to 1 and 'no' to 0
+# .str.lower() handles 'Yes' or 'YES'
+df[COLUMN] = df[COLUMN].str.strip().str.lower().map({
+    'yes': 1, 
+    'no': 0
+})
+
+# 3. Save the new file
+df.to_csv(FILE_OUT, index=False)
+
+print(f"File saved to {FILE_OUT}")
+########################################## end diabetes label fix ###################################
 
 # -----------------------------------------------------------------
 # --- DYNAMIC CONFIGURATION (via command-line) ---
@@ -18,46 +41,47 @@ def parse_arguments(args_list=None):
     
     # --- Paths ---
     parser.add_argument('--labels-path', type=str, 
-                        default='/kaggle/working/labels_brset.csv',
+                        default='data/labels_brset_new.csv',
                         help="Path to the master labels.csv file")
     parser.add_argument('--image-dir', type=str, 
-                        default='/kaggle/input/brset-retina-fundus-diagnose-image-dataset/data/fundus_photos', 
+                        default='data/fundus_photos', 
                         help="Path to the directory containing all images")
     parser.add_argument('--checkpoint-dir', type=str, default="checkpoints", help="Root directory to save all checkpoints")
     
     # --- MLflow Config ---
     parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
-    parser.add_argument('--mlflow-uri', type=str, default='http://localhost:5000', help="MLflow tracking server URI")
+    parser.add_argument('--mlflow-uri', type=str, default='http://localhost:443', help="MLflow tracking server URI")
     parser.add_argument('--mlflow-experiment', type=str, default='Retina MoE Project', help="MLflow experiment name")
     
     # --- Model Config (Global) ---
-    parser.add_argument('--gate-model-name', type=str, default='resnet', help="Model name for the Gate")
-    parser.add_argument('--gate-model-size', type=str, default='small', help="Model size for the Gate")
-    parser.add_argument('--expert-model-name', type=str, default='resnet', help="Model name for the Experts")
+    parser.add_argument('--gate-model-name', type=str, default='efficientnet', help="Model name for the Gate")
+    parser.add_argument('--gate-model-size', type=str, default='medium', help="Model size for the Gate")
+    parser.add_argument('--expert-model-name', type=str, default='efficientnet', help="Model name for the Experts")
     parser.add_argument('--expert-model-size', type=str, default='small', help="Model size for the Experts")
     
     # --- LoRA Config (Global) ---
     parser.add_argument('--use-lora', action='store_true', help="Use LoRA for both Gate and Experts")
     parser.add_argument('--use-qlora', action='store_true', help="Use Q-LoRA for both Gate and Experts")
-    parser.add_argument('--lora-r', type=int, default=16, help="LoRA rank")
+    parser.add_argument('--lora-r', type=int, default=256, help="LoRA rank")
     
     # --- Training Params (Global) ---
-    parser.add_argument('--gate-epochs', type=int, default=25, help="Epochs for Gate training")
-    parser.add_argument('--expert-epochs', type=int, default=25, help="Epochs for Expert training")
-    parser.add_argument('--batch-size', type=int, default=512, help="Batch size for Gate/Expert training")
+    parser.add_argument('--gate-epochs', type=int, default=10, help="Epochs for Gate training")
+    parser.add_argument('--expert-epochs', type=int, default=10, help="Epochs for Expert training")
+    parser.add_argument('--batch-size-gate', type=int, default=128, help="Batch size for Gate training")
+    parser.add_argument('--batch-size-expert', type=int, default=512, help="Batch size for Expert training")
     parser.add_argument('--base-lr', type=float, default=1e-4, help="Learning rate for Gate/Expert training")
     parser.add_argument('--patience', type=int, default=5, help="Early stopping patience")
     
     # --- Calibration Params ---
-    parser.add_argument('--calibrate-epochs', type=int, default=3, help="Epochs for MoE calibration")
-    parser.add_argument('--calibrate-batch-size', type=int, default=512, help="Batch size for calibration")
+    parser.add_argument('--calibrate-epochs', type=int, default=10, help="Epochs for MoE calibration")
+    parser.add_argument('--calibrate-batch-size', type=int, default=4, help="Batch size for calibration")
     parser.add_argument('--calibrate-lr', type=float, default=1e-6, help="Learning rate for calibration")
 
     # --- Evaluation Params ---
     parser.add_argument('--eval-batch-size', type=int, default=64, help="Batch size for final evaluation")
 
     # --- System Params ---
-    parser.add_argument('--num-workers', type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument('--num-workers', type=int, default=60, help="Number of dataloader workers")
     
     # MODIFIED: Pass 'args_list' to parse_known_args
     # If args_list is None, it defaults to using sys.argv (command-line)
@@ -133,7 +157,7 @@ def run_phase_1_gate(args, log_file):
         '--model-name', args.gate_model_name,
         '--model-size', args.gate_model_size,
         '--epochs', str(args.gate_epochs),
-        '--batch-size', str(args.batch_size),
+        '--batch-size', str(args.batch_size_gate),
         '--lr', str(args.base_lr),
         '--patience', str(args.patience),
         '--num-workers', str(args.num_workers),
@@ -164,7 +188,7 @@ def run_phase_2_experts(args, log_file):
             '--model-name', args.expert_model_name,
             '--model-size', args.expert_model_size,
             '--epochs', str(args.expert_epochs),
-            '--batch-size', str(args.batch_size),
+            '--batch-size', str(args.batch_size_expert),
             '--lr', str(args.base_lr),
             '--patience', str(args.patience),
             '--num-workers', str(args.num_workers),
@@ -251,6 +275,20 @@ def main(args_list=None):
     log_filename = f"pipeline_log_{timestamp}.txt"
     print(f"Starting full pipeline. Log will be saved to: {log_filename}")
     print(f"Using {len(args.PATHOLOGIES)} pathologies: {args.PATHOLOGIES}")
+
+    
+    # # --- START FIX: Set DDP Environment Variables for Stability ---
+    # # 1. Define the necessary environment variables for local DDP
+    # if 'MASTER_ADDR' not in os.environ:
+    #     os.environ['MASTER_ADDR'] = '127.0.0.1'
+    # if 'MASTER_PORT' not in os.environ:
+    #     # Use a high, unique port
+    #     os.environ['MASTER_PORT'] = '12345'
+    
+    # # 2. Force the more stable GLOO backend for communication (less prone to SIGSEGV than NCCL locally)
+    # os.environ['PL_TORCH_DISTRIBUTED_BACKEND'] = 'gloo'
+    # # --- END FIX ---
+    
     
     if args.use_mlflow:
         print(f"\n--- MLFLOW IS ENABLED ---")
@@ -306,16 +344,7 @@ if __name__ == "__main__":
     # type them on the command line.
     #
     notebook_args = [
-        '--labels-path', '/kaggle/working/my_labels.csv',
-        '--image-dir', '/kaggle/input/my-image-dataset/images',
-        '--checkpoint-dir', '/kaggle/working/checkpoints',
         '--use-mlflow',
-        '--gate-epochs', '10',
-        '--expert-epochs', '10',
-        '--batch-size', '256',
-        '--use-lora'  # <-- Explicitly adding this flag
-        # '--use-qlora' # <-- Uncomment to use QLoRA
-        # '--lora-r', '32'  # <-- Example of overriding a default
     ]
     #
     # --- ^ ^ ^ --- EDIT YOUR ARGUMENTS HERE --- ^ ^ ^ ---

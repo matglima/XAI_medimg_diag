@@ -247,14 +247,25 @@ def create_model(model_name, model_size='base', pretrained=True, num_classes=1,
         lora_r=lora_r 
     )
 
-def get_optimizer(model, lr, use_qlora=False):
+def get_optimizer(params_to_optimize, lr, use_qlora=False):
     """
     Returns the appropriate optimizer.
     AdamW8bit is required for Q-LoRA.
     """
     if use_qlora and PEFT_INSTALLED:
         print("Using 8-bit AdamW optimizer for Q-LoRA")
-        return AdamW8bit(model.parameters(), lr=lr)
+        if 'bnb' not in globals() and 'bitsandbytes' not in globals():
+             # Lazy import for bnb if it wasn't imported globally
+             import bitsandbytes as bnb
+        if isinstance(params_to_optimize, list):
+            return AdamW8bit(params_to_optimize, lr=lr)
+        else:
+             # Fallback for models passed directly, though discouraged
+             return AdamW8bit(params_to_optimize.parameters(), lr=lr)
     else:
         print("Using standard AdamW optimizer")
-        return torch.optim.AdamW(model.parameters(), lr=lr)
+        # FIX: Use the list directly. If a full model object is passed, use .parameters()
+        if isinstance(params_to_optimize, list):
+             return torch.optim.AdamW(params_to_optimize, lr=lr)
+        else:
+             return torch.optim.AdamW(params_to_optimize.parameters(), lr=lr)

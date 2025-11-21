@@ -63,19 +63,46 @@ class HybridMoE(nn.Module):
         else:
             full_path = f"{gate_ckpt_path}.pth" if not gate_ckpt_path.endswith('.pth') else gate_ckpt_path
             print(f"Loading full weights for Gate from: {full_path}")
-            self.gate.load_state_dict(torch.load(full_path, map_location=self.device))
+            
+            # Load raw state dict
+            state_dict = torch.load(full_path, map_location=self.device, weights_only=False)
+            
+            # --- FIX: Add 'model.' prefix for non-LoRA loading ---
+            # The saved file (from 1_train_gate.py) has keys like 'features.0...'
+            # But self.gate is a ModelWrapper, so it expects 'model.features.0...'
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_state_dict[f'model.{k}'] = v
+            
+            # Load with the corrected keys
+            self.gate.load_state_dict(new_state_dict)
+            # --- END FIX ---
     
         # 2. Load Expert Weights
         for i, pathology in enumerate(self.pathology_list):
             if expert_is_lora:
                 if not PEFT_INSTALLED: raise ImportError("PEFT not installed.")
-                adapter_path = os.path.join(expert_ckpt_dir, f"{pathology}_lora_adapters")
+                
+                # --- FIX: Ensure path is correct (no suffixes) ---
+                adapter_path = os.path.join(expert_ckpt_dir, pathology)
+                # -----------------------------------------------
+                
                 print(f"Loading LoRA adapters for expert: {pathology}")
                 self.experts[i].model = PeftModel.from_pretrained(self.experts[i].model, adapter_path)
             else:
-                model_path = os.path.join(expert_ckpt_dir, f"{pathology}_best_model.pth")
+                model_path = os.path.join(expert_ckpt_dir, f"{pathology}.pth")
                 print(f"Loading full weights for expert: {pathology}")
-                self.experts[i].load_state_dict(torch.load(model_path, map_location=self.device))
+                
+                # Load raw state dict
+                state_dict = torch.load(model_path, map_location=self.device, weights_only=False)
+
+                # --- FIX: Add 'model.' prefix for expert non-LoRA loading ---
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_state_dict[f'model.{k}'] = v
+                
+                self.experts[i].load_state_dict(new_state_dict)
+                # --- END FIX ---
         
         print("All checkpoints loaded successfully.")
 
@@ -84,9 +111,6 @@ class HybridMoE(nn.Module):
         This forward pass is dense and non-sparse, designed for calibration.
         It gets a general prediction from the gate and a specific prediction
         from each expert, then combines them.
-        
-        This architecture assumes the final calibration step will teach
-        the models how to "add" their knowledge together.
         """
         # 1. Gate provides a multi-label overview
         gate_logits = self.gate(x) # Shape: [B, 14]
@@ -99,8 +123,6 @@ class HybridMoE(nn.Module):
         expert_logits_tensor = torch.cat(expert_logits, dim=1) # Shape: [B, 14]
         
         # 3. Combine knowledge. Simple addition is a robust start.
-        # The calibration will fine-tune the biases (final linear layers)
-        # to make this addition meaningful.
         final_logits = gate_logits + expert_logits_tensor
         
         return final_logits

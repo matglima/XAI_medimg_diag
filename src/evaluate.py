@@ -110,11 +110,56 @@ def main(args):
 
     # --- 2. Initialize MoE Structure ---
     logger.info("Initializing HybridMoE structure for evaluation...")
-    model = HybridMoE(gate_config, expert_config, PATHOLOGIES, device)
-    
+    # 1. Load the state dictionary
+    state_dict = torch.load(args.model_path, map_location=device, weights_only=False)
+    # The saved state_dict already has merged weights, so the model must be initialized
+    # as a standard (non-PEFT) model to accept all feature layer keys.
+    model = HybridMoE(
+        gate_config=dict(
+            model_name=args.gate_model_name,
+            model_size=args.gate_model_size,
+            # REMOVED: use_lora=args.gate_use_lora, use_qlora=args.gate_use_qlora
+            use_lora=False, # <-- NEW
+            use_qlora=False, # <-- NEW
+            lora_r=args.lora_r
+        ),
+        expert_config=dict(
+            model_name=args.expert_model_name,
+            model_size=args.expert_model_size,
+            # REMOVED: use_lora=args.expert_use_lora, use_qlora=args.expert_use_qlora
+            use_lora=False, # <-- NEW
+            use_qlora=False, # <-- NEW
+            lora_r=args.lora_r
+        ),
+        pathology_list=PATHOLOGIES,
+        device=device
+    ).to(device)
     # --- 3. Load Final Calibrated Weights ---
     logger.info(f"Loading final calibrated model from: {args.model_path}")
-    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
+    # --- START FIX: Strip redundant 'base_model.model' prefix ---
+    new_state_dict = {}
+    prefix_to_strip = "base_model.model."
+    
+    for k, v in state_dict.items():
+        # Check for the primary PEFT-related prefix that exists in the saved file
+        if prefix_to_strip in k:
+            # We strip the full prefix, keeping the rest of the key (e.g., 'gate.model.features...')
+            new_key = k.replace(prefix_to_strip, "")
+            new_state_dict[new_key] = v
+        else:
+            # Keep the key as-is (e.g., final classifier head keys might not be prefixed)
+            new_state_dict[k] = v
+
+    # 2. Load the state dict using the cleaned keys
+    # Use strict=False as a safeguard against any minor key discrepancies
+    load_result = model.load_state_dict(new_state_dict, strict=False)
+    
+    # Optional: Log the result for confirmation (check if 'missing' is empty)
+    if load_result.missing_keys:
+        logger.warning(f"Still missing keys after cleanup: {load_result.missing_keys[:5]}...")
+    else:
+        logger.info("All model weights successfully loaded after prefix cleanup.")
+    # --- END FIX ---
     model.to(device)
     model.eval()
     

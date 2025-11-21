@@ -54,7 +54,7 @@ def get_global_cache():
             raise FileNotFoundError(cache_path)
         
         print("Loading image cache from disk... This may take a moment.")
-        _GLOBAL_IMAGE_CACHE = torch.load(cache_path)
+        _GLOBAL_IMAGE_CACHE = torch.load(cache_path, weights_only=False)
         print(f"Image cache loaded. {len(_GLOBAL_IMAGE_CACHE)} images in RAM.")
     return _GLOBAL_IMAGE_CACHE
 

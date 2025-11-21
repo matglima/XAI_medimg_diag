@@ -250,9 +250,7 @@ def main(args):
             mlflow.pytorch.autolog(
                 log_models=False,
                 log_datasets=False,
-                log_input_examples=False,
-                log_loss_metrics=True,
-                log_opt_hyperparams=True
+                registered_model_name=args.run_name,
             )
             # We use a nested run for better organization
             mlf_logger = MLFlowLogger(
@@ -271,6 +269,7 @@ def main(args):
         max_epochs=args.epochs,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
+        # strategy='fsdp',
         logger=mlflow_logger if args.use_mlflow else False,
         callbacks=callbacks,
         log_every_n_steps=10
@@ -296,7 +295,10 @@ def main(args):
     else:
         logger.info(f"Loading best model from: {best_ckpt_path}")
         best_model_to_save = ExpertModule.load_from_checkpoint(best_ckpt_path).model
-
+    
+    if hasattr(best_model_to_save, 'model'):
+        best_model_to_save = best_model_to_save.model
+    
     if args.use_lora or args.use_qlora:
         # Save as PEFT adapters in a subdirectory named after the label
         final_save_dir = os.path.join(args.output_dir, args.target_label)
