@@ -16,7 +16,7 @@ import warnings
 # --- Lightning Imports ---
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
-from lightning.pytorch.loggers.mlflow import MLFlowLogger
+from lightning.pytorch.loggers import MLFlowLogger
 # --- End Lightning Imports ---
 
 # --- MLflow Autolog ---
@@ -65,49 +65,36 @@ class CalibrationModule(pl.LightningModule):
         logger.info("Initializing HybridMoE structure...")
         self.model = HybridMoE(gate_config, expert_config, self.PATHOLOGIES, 'cpu')
         
-        # --- 2. Load All Checkpoints ---
-        logger.info("Loading pre-trained checkpoints...")
+        # --- CRITICAL CHANGE: NO LOADING HERE ---
+        # We do not call load_checkpoints here to avoid the "Double Loading" crash 
+        # and the "Optimizer Empty List" crash.
         
-        # --- START FIX: Correctly find gate checkpoint and resolve path ---
-        gate_ckpt_path = self.hparams.gate_ckpt_path
-        if not self.hparams.gate_use_lora:
-            try:
-                gate_ckpt_file = [f for f in os.listdir(gate_ckpt_path) if f.endswith('.pth')][0]
-                gate_ckpt_path = os.path.join(gate_ckpt_path, gate_ckpt_file)
-                logger.info(f"Found full gate checkpoint: {gate_ckpt_path}")
-                gate_ckpt_path = os.path.abspath(gate_ckpt_path) # Prevent Hub lookup
-            except IndexError:
-                logger.error(f"CRITICAL: --gate-use-lora=False, but no .pth file found in {gate_ckpt_path}")
-                raise FileNotFoundError(f"No .pth checkpoint found in {self.hparams.gate_ckpt_path}.")
-        else:
-            logger.info(f"Using LoRA adapters for gate from: {gate_ckpt_path}")
-            gate_ckpt_path = os.path.abspath(gate_ckpt_path) # Prevent Hub lookup
-        # --- END FIX ---
-        expert_ckpt_dir = self.hparams.expert_ckpt_dir
-        # Resolve to absolute path to prevent PEFT/HF lookup issues in moe_model.py
-        expert_ckpt_dir = os.path.abspath(expert_ckpt_dir)
-        logger.info(f"Resolved expert checkpoint directory to: {expert_ckpt_dir}")
-        
-        self.model.load_checkpoints(
-            gate_ckpt_path=gate_ckpt_path,
-            expert_ckpt_dir=self.hparams.expert_ckpt_dir,
-            gate_is_lora=self.hparams.gate_use_lora,
-            expert_is_lora=self.hparams.expert_use_lora
-        )
-        
-        # --- 3. Freeze Parameters for Calibration ---
-        logger.info("Freezing model parameters for calibration...")
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.validation_step_outputs = []
+
+    def setup_trainable_parameters(self):
+        """
+        Configures requires_grad for all parameters.
+        Must be called AFTER load_checkpoints() injects LoRA adapters in main().
+        """
+        logger.info("Configuring trainable parameters (Freezing base, Unfreezing LoRA/Heads)...")
         total_params, trainable_params = 0, 0
+        
         for name, param in self.model.named_parameters():
             total_params += param.numel()
+            # 1. Default: Freeze everything
             param.requires_grad = False
+            
+            # 2. Unfreeze logic: LoRA adapters, Classifiers/Heads
+            # We match common names for heads/adapters
             if 'lora_' in name or 'fc' in name or 'classifier' in name or 'head' in name:
                 param.requires_grad = True
                 trainable_params += param.numel()
+        
+        if trainable_params == 0:
+            logger.warning("WARNING: No trainable parameters found! Check layer names.")
+            
         logger.info(f"Calibration params: {trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)")
-
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.validation_step_outputs = []
 
     def forward(self, x):
         return self.model(x)
@@ -143,6 +130,8 @@ class CalibrationModule(pl.LightningModule):
         self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
+        # This list will be populated correctly because setup_trainable_parameters 
+        # is called in main() before the trainer starts.
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         use_qlora = self.hparams.gate_use_qlora or self.hparams.expert_use_qlora
         optimizer = get_optimizer(trainable_params, self.hparams.lr, use_qlora)
@@ -206,11 +195,41 @@ def main(args):
     # --- 2. Init Model ---
     model = CalibrationModule(args)
     os.makedirs(args.output_dir, exist_ok=True)
-    # --- 3. Init Loggers and Callbacks ---
-    callbacks = [
-        TQDMProgressBar(refresh_rate=10)
-    ]
+
+    # --- 3. Manually Load Checkpoints HERE (Only for training start) ---
+    logger.info("Loading pre-trained checkpoints into initialized model...")
     
+    gate_ckpt_path = args.gate_ckpt_path
+    if not args.gate_use_lora:
+        try:
+            gate_ckpt_file = [f for f in os.listdir(gate_ckpt_path) if f.endswith('.pth')][0]
+            gate_ckpt_path = os.path.join(gate_ckpt_path, gate_ckpt_file)
+            logger.info(f"Found full gate checkpoint: {gate_ckpt_path}")
+            gate_ckpt_path = os.path.abspath(gate_ckpt_path)
+        except IndexError:
+            logger.error(f"CRITICAL: --gate-use-lora=False, but no .pth file found in {gate_ckpt_path}")
+            raise FileNotFoundError(f"No .pth checkpoint found in {args.gate_ckpt_path}.")
+    else:
+        logger.info(f"Using LoRA adapters for gate from: {gate_ckpt_path}")
+        gate_ckpt_path = os.path.abspath(gate_ckpt_path)
+
+    expert_ckpt_dir = os.path.abspath(args.expert_ckpt_dir)
+    logger.info(f"Resolved expert checkpoint directory to: {expert_ckpt_dir}")
+    
+    # Load weights (Injects LoRA if applicable)
+    model.model.load_checkpoints(
+        gate_ckpt_path=gate_ckpt_path,
+        expert_ckpt_dir=expert_ckpt_dir,
+        gate_is_lora=args.gate_use_lora,
+        expert_is_lora=args.expert_use_lora
+    )
+
+    # --- 4. Configure Trainable Parameters ---
+    # We do this AFTER load_checkpoints so the optimizer sees the correct parameters
+    model.setup_trainable_parameters()
+
+    # --- 5. Init Loggers and Callbacks ---
+    callbacks = [ TQDMProgressBar(refresh_rate=10) ]
     mlflow_logger = None
     checkpoint_callback = None 
     
@@ -220,89 +239,90 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
-            # --- We can use full autolog here, as it saves a .ckpt ---
             mlflow.pytorch.autolog(
-                # log_models=True,
-                # checkpoint=True,
-                # checkpoint_monitor='cal_val_auc_macro',
-                # checkpoint_mode='max',
-                # checkpoint_save_best_only=True,
-                # checkpoint_save_freq='epoch',
+                log_models=True, checkpoint=True, log_datasets=False,
+                checkpoint_monitor='cal_val_auc_macro', checkpoint_mode='max',
+                checkpoint_save_best_only=True, checkpoint_save_freq='epoch',
+                checkpoint_dirpath=args.output_dir, checkpoint_filename='moe_calibrated_best'
             )
             mlflow_logger = MLFlowLogger(
                 experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
-                run_name=args.run_name,
-                tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
+                run_name=args.run_name, tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
             )
             
     if not args.use_mlflow:
         logger.info("MLflow is disabled. Using local ModelCheckpoint.")
         checkpoint_callback = ModelCheckpoint(
-            dirpath=args.output_dir,
-            filename='moe_calibrated_best',
-            monitor='cal_val_auc_macro',
-            mode='max',
-            save_top_k=1,
+            dirpath=args.output_dir, filename='moe_calibrated_best',
+            monitor='cal_val_auc_macro', mode='max', save_top_k=1,
         )
         callbacks.append(checkpoint_callback)
 
-    # --- 4. Init Trainer ---
+    # --- 6. Init Trainer ---
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
-        # strategy='fsdp',
         logger=mlflow_logger if args.use_mlflow else False,
         callbacks=callbacks
     )
     
-    # --- 5. Run Training ---
+    # --- 7. Run Training ---
     logger.info("--- Starting MoE Calibration ---")
     trainer.fit(model, datamodule=dm)
     
     logger.info("--- MoE Calibration Complete ---")
     
-    # --- 6. Save final merged model ---
-    logger.info("Loading best model from checkpoint...")
+    # --- 8. Save final merged model ---
     
+    # --- START FIX: Avoid reloading from checkpoint if we just finished training ---
+    # We have 'model' in memory which is the trained state. 
+    # If we try load_from_checkpoint() here with LoRA, it will crash because the 
+    # structure won't match (base vs PEFT).
+    
+    # Check if we have a best model checkpoint from Lightning
     best_ckpt_path = ""
     if args.use_mlflow:
         ckpt_dir = os.path.join(args.output_dir, "checkpoints")
         best_ckpt_path = os.path.join(ckpt_dir, "moe_calibrated_best.ckpt")
-    else:
-        if checkpoint_callback:
-            best_ckpt_path = checkpoint_callback.best_model_path
-        else:
-            logger.error("Checkpoint callback was not initialized. Cannot find best model.")
-            best_ckpt_path = ""
+    elif checkpoint_callback:
+        best_ckpt_path = checkpoint_callback.best_model_path
 
-    if not os.path.exists(best_ckpt_path):
-        logger.warning(f"Could not find best checkpoint at {best_ckpt_path}. Saving last model state.")
-        best_model = model
-    else:
-        logger.info(f"Loading best model from: {best_ckpt_path}")
-        best_model = CalibrationModule.load_from_checkpoint(best_ckpt_path)
+    best_model_to_save = model # Default to current state (last epoch)
     
+    if best_ckpt_path and os.path.exists(best_ckpt_path):
+        logger.info(f"Loading best model weights from: {best_ckpt_path}")
+        # We load the weights into the EXISTING model object (which has the correct LoRA structure)
+        # instead of creating a new one via load_from_checkpoint
+        checkpoint = torch.load(best_ckpt_path, map_location=model.device)
+        model.load_state_dict(checkpoint['state_dict'])
+        best_model_to_save = model
+    else:
+        logger.warning("Could not find best checkpoint. Saving the last model state.")
+
+    # --- 9. Merge and Save ---
     if args.gate_use_lora or args.expert_use_lora:
         logger.info("Merging LoRA adapters into base model for final saving...")
-        if args.gate_use_lora and hasattr(best_model.model.gate, 'model') and hasattr(best_model.model.gate.model, 'merge_and_unload'):
+        
+        # Use best_model_to_save.model to access the HybridMoE
+        moe_inner = best_model_to_save.model 
+        
+        if args.gate_use_lora and hasattr(moe_inner.gate, 'model') and hasattr(moe_inner.gate.model, 'merge_and_unload'):
             try:
-                best_model.model.gate.model = best_model.model.gate.model.merge_and_unload()
+                moe_inner.gate.model = moe_inner.gate.model.merge_and_unload()
                 logger.info("Gate adapters merged.")
-            except Exception as e:
-                logger.warning(f"Could not merge gate adapters: {e}. Saving unmerged.")
+            except Exception as e: logger.warning(f"Could not merge gate adapters: {e}. Saving unmerged.")
         
         if args.expert_use_lora:
-            for i, expert in enumerate(best_model.model.experts):
+            for i, expert in enumerate(moe_inner.experts):
                 if hasattr(expert, 'model') and hasattr(expert.model, 'merge_and_unload'):
                     try:
                         expert.model = expert.model.merge_and_unload()
-                    except Exception as e:
-                        logger.warning(f"Could not merge expert {i} adapters: {e}. Saving unmerged.")
+                    except Exception as e: logger.warning(f"Could not merge expert {i} adapters: {e}. Saving unmerged.")
             logger.info("Expert adapters merged.")
     
     final_save_path = os.path.join(args.output_dir, "moe_calibrated_final.pth")
-    torch.save(best_model.model.state_dict(), final_save_path)
+    torch.save(best_model_to_save.model.state_dict(), final_save_path)
     logger.info(f"Final merged model saved to {final_save_path}")
 
 if __name__ == "__main__":

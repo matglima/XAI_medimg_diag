@@ -4,6 +4,7 @@
 # Description:
 # Phase 1B: Trains the 14 Binary "Expert" models.
 # Refactored to PyTorch Lightning for clean logging and MLflow.
+# Metrics updated to use Macro averages for consistency.
 # -----------------------------------------------------------------
 
 import argparse
@@ -105,8 +106,9 @@ class ExpertModule(pl.LightningModule):
         
         metrics = self._calculate_metrics(targets, preds)
         
-        self.log('val_auc', metrics['auc'], prog_bar=True)
-        self.log('val_f1', metrics['f1'])
+        # Log macro metrics
+        self.log('val_auc_macro', metrics['auc_macro'], prog_bar=True)
+        self.log('val_f1_macro', metrics['f1_macro'])
         
         self.validation_step_outputs.clear()
 
@@ -127,17 +129,18 @@ class ExpertModule(pl.LightningModule):
         
         metrics = self._calculate_metrics(targets, preds)
         
-        self.log('test_auc', metrics['auc'])
-        self.log('test_f1', metrics['f1'])
+        # Log macro metrics
+        self.log('test_auc_macro', metrics['auc_macro'])
+        self.log('test_f1_macro', metrics['f1_macro'])
 
         print(f"\n--- Expert '{self.hparams.target_label}' Test Metrics ---")
-        print(f"Test AUC: {metrics['auc']:.4f}")
-        print(f"Test F1:  {metrics['f1']:.4f}")
+        print(f"Test AUC (Macro): {metrics['auc_macro']:.4f}")
+        print(f"Test F1 (Macro):  {metrics['f1_macro']:.4f}")
 
         if self.hparams.use_mlflow and MLFLOW_AVAILABLE:
             mlflow.log_metrics({
-                'test_auc': metrics['auc'],
-                'test_f1': metrics['f1']
+                'test_auc_macro': metrics['auc_macro'],
+                'test_f1_macro': metrics['f1_macro']
             })
 
         self.test_step_outputs.clear()
@@ -149,7 +152,7 @@ class ExpertModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_auc",
+                "monitor": "val_auc_macro", # Monitor macro AUC
                 "mode": "max"
             },
         }
@@ -158,11 +161,15 @@ class ExpertModule(pl.LightningModule):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
+                # For binary classification, AUC is effectively macro avg
                 auc = roc_auc_score(targets, preds)
             except ValueError:
                 auc = 0.5
-            f1 = f1_score(targets, np.round(preds), zero_division=0)
-        return {'f1': f1, 'auc': auc}
+            
+            # Use macro average for F1
+            f1 = f1_score(targets, np.round(preds), average='macro', zero_division=0)
+            
+        return {'f1_macro': f1, 'auc_macro': auc}
 
 # --- DataModule for Lightning ---
 
@@ -170,9 +177,30 @@ class ExpertDataModule(pl.LightningDataModule):
     def __init__(self, hparams):
         super().__init__()
         self.save_hyperparameters(hparams)
-        self.labels_df = pd.read_csv(self.hparams.labels_path)
+        
+        # Load and clean labels same as in gate
+        self.labels_df = self._load_and_clean_labels(self.hparams.labels_path, [self.hparams.target_label])
+        
         self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
         self.splits = get_stratified_splits(self.labels_df, self.hparams.target_label)
+
+    def _load_and_clean_labels(self, labels_path, pathology_columns):
+        """Loads CSV and converts 'yes'/'no' labels to 1/0."""
+        df = pd.read_csv(labels_path)
+        
+        # Check if cleaning is necessary 
+        needs_cleaning = (
+            (df[pathology_columns].eq('yes').any().any()) or 
+            (df[pathology_columns].eq('no').any().any())
+        )
+        
+        if needs_cleaning:
+            logger.info("Cleaning 'yes'/'no' labels to 1/0 for training.")
+            for col in pathology_columns:
+                df[col] = df[col].astype(str).str.lower().map({'yes': 1, 'no': 0}).fillna(df[col])
+            df[pathology_columns] = df[pathology_columns].apply(pd.to_numeric, errors='coerce')
+        
+        return df
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
@@ -221,12 +249,12 @@ def main(args):
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.output_dir, # Save directly to the expert dir
         filename=f'{args.target_label}_best_model',
-        monitor='val_auc',
+        monitor='val_auc_macro', # Monitor macro metric
         mode='max',
         save_top_k=1,
     )
     callbacks = [
-        EarlyStopping(monitor='val_auc', patience=args.patience, mode='max', verbose=True),
+        EarlyStopping(monitor='val_auc_macro', patience=args.patience, mode='max', verbose=True),
         TQDMProgressBar(refresh_rate=10),
         checkpoint_callback # Always add the callback
     ]
@@ -240,20 +268,13 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
-            # --- START FIX: Disable MLflow's checkpointing ---
-            mlflow.pytorch.autolog(
-                log_models=False, # Disable auto-logging models
-                checkpoint=False, # Disable auto-checkpointing
-                disable=True      # Disable complex autologging
-            )
-            # Re-enable simple metric logging
+            # --- We can use full autolog here, as it saves a .ckpt ---
             mlflow.pytorch.autolog(
                 log_models=False,
+                checkpoint=False,
                 log_datasets=False,
-                registered_model_name=args.run_name,
             )
-            # We use a nested run for better organization
-            mlf_logger = MLFlowLogger(
+            mlflow_logger = MLFlowLogger(
                 experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
                 run_name=args.run_name,
                 tracking_uri=os.environ.get('MLFLOW_TRACKING_URI')
@@ -261,7 +282,6 @@ def main(args):
 
     if not args.use_mlflow:
         logger.info("MLflow is disabled. Using local ModelCheckpoint.")
-        # This is now handled above
         pass
 
     # --- 4. Init Trainer ---
@@ -296,6 +316,7 @@ def main(args):
         logger.info(f"Loading best model from: {best_ckpt_path}")
         best_model_to_save = ExpertModule.load_from_checkpoint(best_ckpt_path).model
     
+    # Unwrap ModelWrapper
     if hasattr(best_model_to_save, 'model'):
         best_model_to_save = best_model_to_save.model
     
@@ -339,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--alpha', type=float, default=0.25)
+    parser.add_argument('--alpha', type=float, default=0.75)
     parser.add_argument('--gamma', type=float, default=2.0)
     parser.add_argument('--use-lora', action='store_true')
     parser.add_argument('--use-qlora', action='store_true')

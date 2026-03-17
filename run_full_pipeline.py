@@ -62,7 +62,7 @@ def parse_arguments(args_list=None):
     # --- LoRA Config (Global) ---
     parser.add_argument('--use-lora', action='store_true', help="Use LoRA for both Gate and Experts")
     parser.add_argument('--use-qlora', action='store_true', help="Use Q-LoRA for both Gate and Experts")
-    parser.add_argument('--lora-r', type=int, default=256, help="LoRA rank")
+    parser.add_argument('--lora-r', type=int, default=128, help="LoRA rank")
     
     # --- Training Params (Global) ---
     parser.add_argument('--gate-epochs', type=int, default=10, help="Epochs for Gate training")
@@ -75,7 +75,7 @@ def parse_arguments(args_list=None):
     # --- Calibration Params ---
     parser.add_argument('--calibrate-epochs', type=int, default=10, help="Epochs for MoE calibration")
     parser.add_argument('--calibrate-batch-size', type=int, default=4, help="Batch size for calibration")
-    parser.add_argument('--calibrate-lr', type=float, default=1e-6, help="Learning rate for calibration")
+    parser.add_argument('--calibrate-lr', type=float, default=1e-5, help="Learning rate for calibration")
 
     # --- Evaluation Params ---
     parser.add_argument('--eval-batch-size', type=int, default=64, help="Batch size for final evaluation")
@@ -336,41 +336,49 @@ def main(args_list=None):
 # --- MODIFIED: Notebook-friendly execution ---
 # -----------------------------------------------------------------
 
+# -----------------------------------------------------------------
+# --- MODIFIED: Notebook-friendly execution ---
+# -----------------------------------------------------------------
+
 if __name__ == "__main__":
     
-    # --- V V V --- EDIT YOUR ARGUMENTS HERE --- V V V ---
-    #
-    # Define your arguments as a list of strings, just as you would
-    # type them on the command line.
-    #
-    notebook_args = [
-        '--use-mlflow',
-    ]
-    #
-    # --- ^ ^ ^ --- EDIT YOUR ARGUMENTS HERE --- ^ ^ ^ ---
-
-
-    # To run with the script's built-in defaults, use an empty list:
-    # notebook_args = []
-    
-    # To run from the command line, this block is skipped and
-    # 'main()' would be called with 'args_list=None',
-    # which defaults to using sys.argv.
-    
-    print(f"--- Running pipeline in NOTEBOOK mode with arguments: ---")
-    print(notebook_args)
-    print("---------------------------------------------------------")
-
-    try:
-        # Pass the list of arguments to main()
-        main(notebook_args)
+    # Check if CLI arguments were passed
+    if len(sys.argv) > 1:
+        # CLI MODE: The user provided arguments (e.g., --use-mlflow ...)
+        print("--- Running pipeline in CLI mode ---")
+        # Pass None to main(), so parse_arguments uses sys.argv automatically
+        try:
+            main(None)
+        except SystemExit as e:
+            if e.code != 0:
+                print(f"\nPIPELINE FAILED (caught SystemExit code: {e.code})", file=sys.stderr)
+        except Exception as e:
+            print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+            
+    else:
+        # NOTEBOOK / DEFAULT MODE: No arguments provided
+        print("--- Running pipeline in DEFAULT/NOTEBOOK mode (No CLI args provided) ---")
         
-    except SystemExit as e:
-        # This block catches sys.exit() calls
-        if e.code == 0:
-            print("\nPipeline finished successfully (caught SystemExit 0).")
-        else:
-            print(f"\nPIPELINE FAILED (caught SystemExit code: {e.code})", file=sys.stderr)
-    except Exception as e:
-        # Catch any other unexpected errors
-        print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
+        # Define your defaults here. These will ONLY be used if you run
+        # "python run_full_pipeline.py" with NO other arguments.
+        notebook_args = [
+            '--use-mlflow',
+            '--gate-epochs', '10',
+            '--expert-epochs', '10',
+            '--batch-size-gate', '128',
+            '--batch-size-expert', '512',
+            '--calibrate-batch-size', '4',
+            '--use-lora', 
+            '--lora-r', '256'
+        ]
+        
+        print(f"Using default arguments: {notebook_args}")
+        print("---------------------------------------------------------")
+
+        try:
+            main(notebook_args)
+        except SystemExit as e:
+            if e.code != 0:
+                print(f"\nPIPELINE FAILED (caught SystemExit code: {e.code})", file=sys.stderr)
+        except Exception as e:
+            print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)

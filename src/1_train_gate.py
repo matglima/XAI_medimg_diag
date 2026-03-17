@@ -40,6 +40,23 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- Focal Loss ---
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    def forward(self, inputs, targets):
+        BCE_loss = nn.functional.binary_cross_entropy_with_logits(
+            inputs, targets.float(), reduction='none'
+        )
+        pt = torch.exp(-BCE_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        if self.reduction == 'mean': return focal_loss.mean()
+        elif self.reduction == 'sum': return focal_loss.sum()
+        return focal_loss
+
 # --- PyTorch Lightning Module ---
 
 class GateModule(pl.LightningModule):
@@ -61,7 +78,7 @@ class GateModule(pl.LightningModule):
             lora_r=self.hparams.lora_r
         )
         
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.criterion = FocalLoss(alpha=self.hparams.alpha, gamma=self.hparams.gamma)
         self.validation_step_outputs = []
         self.test_step_outputs = []
 
@@ -242,22 +259,16 @@ def main(args):
             args.use_mlflow = False
         else:
             logger.info("Enabling MLflow autologging...")
-            # --- START FIX: Disable MLflow's checkpointing ---
-            # We use Lightning's checkpointing to find the best .ckpt
-            # and then save the final model format manually.
-            mlflow.pytorch.autolog(
-                log_models=False, # Disable auto-logging models
-                checkpoint=False, # Disable auto-checkpointing
-                disable=True      # Disable complex autologging
-            )
-            # Re-enable simple metric logging
+            # --- We can use full autolog here, as it saves a .ckpt ---
             mlflow.pytorch.autolog(
                 log_models=False,
+                checkpoint=False,
                 log_datasets=False,
-                registered_model_name=args.run_name,
+                # checkpoint_monitor='cal_val_auc_macro',
+                # checkpoint_mode='max',
+                # checkpoint_save_best_only=True,
+                # checkpoint_save_freq='epoch',
             )
-            # --- END FIX ---
-            
             mlflow_logger = MLFlowLogger(
                 experiment_name=os.environ.get('MLFLOW_EXPERIMENT_NAME'),
                 run_name=args.run_name,
@@ -343,6 +354,8 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--alpha', type=float, default=0.75)
+    parser.add_argument('--gamma', type=float, default=2.0)
     parser.add_argument('--use-lora', action='store_true')
     parser.add_argument('--use-qlora', action='store_true')
     parser.add_argument('--lora-r', type=int, default=16)
