@@ -24,6 +24,7 @@ from lightning.pytorch.loggers import MLFlowLogger
 # --- End Lightning Imports ---
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
+from experiment_utils import save_run_manifest, set_global_seed
 from models import create_model, get_optimizer
 from config import BRSET_LABELS
 
@@ -191,7 +192,14 @@ class GateDataModule(pl.LightningDataModule):
         self.PATHOLOGIES = BRSET_LABELS
         self.labels_df = pd.read_csv(self.hparams.labels_path)
         self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
-        self.splits = get_random_splits(self.labels_df, test_size=0.2, val_size=0.1)
+        self.splits = get_random_splits(
+            self.labels_df,
+            test_size=0.2,
+            val_size=0.1,
+            random_state=self.hparams.seed,
+            split_manifest_path=self.hparams.split_manifest,
+            save_manifest_path=self.hparams.save_split_manifest,
+        )
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
@@ -216,22 +224,33 @@ class GateDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
 # --- Main execution ---
 
 def main(args):
+    set_global_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger.info("Writing gate run manifest...")
+    save_run_manifest(args.output_dir, "gate_run_manifest.json", args, extra={'phase': 'gate'})
+
     # --- 1. Init Data ---
+    logger.info("Initializing gate data module...")
     dm = GateDataModule(args)
     
     # --- 2. Init Model ---
+    logger.info("Initializing gate model...")
     model = GateModule(args)
     
     # --- 3. Init Loggers and Callbacks ---
@@ -288,7 +307,8 @@ def main(args):
         # strategy='fsdp',
         logger=mlflow_logger if args.use_mlflow else False, # Disable logger if not using MLflow
         callbacks=callbacks,
-        log_every_n_steps=10
+        log_every_n_steps=10,
+        deterministic=True,
     )
     
     # --- 5. Run Training ---
@@ -354,6 +374,9 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split-manifest', type=str, default=None)
+    parser.add_argument('--save-split-manifest', type=str, default=None)
     parser.add_argument('--alpha', type=float, default=0.75)
     parser.add_argument('--gamma', type=float, default=2.0)
     parser.add_argument('--use-lora', action='store_true')

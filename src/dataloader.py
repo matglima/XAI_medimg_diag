@@ -6,6 +6,7 @@
 # NOW loads a pre-built global cache from disk.
 # -----------------------------------------------------------------
 
+import json
 import os
 import torch
 import pandas as pd
@@ -61,8 +62,9 @@ def get_global_cache():
 # --- Dataset for Binary Experts ---
 
 class RetinaDataset(Dataset):
-    def __init__(self, dataframe, image_dir, target_label, transform=None, image_ids=None):
+    def __init__(self, dataframe, image_dir, target_label, transform=None, image_ids=None, return_image_id=False):
         self.transform = transform
+        self.return_image_id = return_image_id
         global_cache = get_global_cache()
         
         # Filter the main dataframe by the specified image_ids
@@ -76,8 +78,9 @@ class RetinaDataset(Dataset):
         self.dataframe = dataframe[dataframe['image_id'].isin(cached_ids)].reset_index(drop=True)
         
         # Now that dataframe is filtered, create the labels and the final image list IN ORDER
+        self.image_ids = self.dataframe['image_id'].astype(str).tolist()
         self.labels = self.dataframe[target_label].astype(np.float32).values
-        self.cached_images = [global_cache[id] for id in self.dataframe['image_id']]
+        self.cached_images = [global_cache[image_id] for image_id in self.image_ids]
 
     def __len__(self):
         return len(self.cached_images)
@@ -88,14 +91,18 @@ class RetinaDataset(Dataset):
         
         if self.transform:
             image = self.transform(image)
-            
+
+        if self.return_image_id:
+            return image, label, self.image_ids[idx]
+
         return image, label
 
 # --- Dataset for Multi-Label Gate & Calibration ---
 
 class MultiLabelRetinaDataset(Dataset):
-    def __init__(self, dataframe, image_dir, pathology_columns, transform=None, image_ids=None):
+    def __init__(self, dataframe, image_dir, pathology_columns, transform=None, image_ids=None, return_image_id=False):
         self.transform = transform
+        self.return_image_id = return_image_id
         self.pathology_columns = pathology_columns
         global_cache = get_global_cache()
 
@@ -106,8 +113,9 @@ class MultiLabelRetinaDataset(Dataset):
         cached_ids = set(global_cache.keys())
         self.dataframe = dataframe[dataframe['image_id'].isin(cached_ids)].reset_index(drop=True)
         
+        self.image_ids = self.dataframe['image_id'].astype(str).tolist()
         self.labels = self.dataframe[self.pathology_columns].astype(np.float32).values
-        self.cached_images = [global_cache[id] for id in self.dataframe['image_id']]
+        self.cached_images = [global_cache[image_id] for image_id in self.image_ids]
 
 
     def __len__(self):
@@ -120,14 +128,56 @@ class MultiLabelRetinaDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
+        if self.return_image_id:
+            return image, label, self.image_ids[idx]
+
         return image, label
 
 # --- Data Splitting Functions ---
 
-def get_stratified_splits(dataframe, target_label, test_size=0.2, val_size=0.1, random_state=42):
+def _normalize_split_ids(image_ids):
+    return [str(image_id) for image_id in image_ids]
+
+
+def load_split_manifest(manifest_path):
+    with open(manifest_path, 'r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+
+    splits = payload.get('splits', payload)
+    return {
+        'train': _normalize_split_ids(splits['train']),
+        'val': _normalize_split_ids(splits['val']),
+        'test': _normalize_split_ids(splits['test'])
+    }
+
+
+def save_split_manifest(splits, output_path, metadata=None):
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = {
+        'splits': {
+            'train': _normalize_split_ids(splits['train']),
+            'val': _normalize_split_ids(splits['val']),
+            'test': _normalize_split_ids(splits['test'])
+        }
+    }
+    if metadata:
+        payload['metadata'] = metadata
+
+    with open(output_path, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def get_stratified_splits(dataframe, target_label, test_size=0.2, val_size=0.1, random_state=42,
+                          split_manifest_path=None, save_manifest_path=None):
     """
     Creates stratified splits for BINARY classification.
     """
+    if split_manifest_path and os.path.exists(split_manifest_path):
+        logger.info(f"Loading split manifest from {split_manifest_path}")
+        return load_split_manifest(split_manifest_path)
+
     # Note: We stratify on the *original* dataframe, not the cached one
     train_val_ids, test_ids = train_test_split(
         dataframe['image_id'],
@@ -143,16 +193,37 @@ def get_stratified_splits(dataframe, target_label, test_size=0.2, val_size=0.1, 
         random_state=random_state
     )
     
-    return {
+    splits = {
         'train': train_ids.tolist(),
         'val': val_ids.tolist(),
         'test': test_ids.tolist()
     }
 
-def get_random_splits(dataframe, test_size=0.2, val_size=0.1, random_state=42):
+    if save_manifest_path:
+        save_split_manifest(
+            splits,
+            save_manifest_path,
+            metadata={
+                'strategy': 'binary_stratified',
+                'target_label': target_label,
+                'seed': random_state,
+                'test_size': test_size,
+                'val_size': val_size,
+            }
+        )
+
+    return splits
+
+
+def get_random_splits(dataframe, test_size=0.2, val_size=0.1, random_state=42,
+                      split_manifest_path=None, save_manifest_path=None):
     """
     Creates random splits for MULTI-LABEL classification.
     """
+    if split_manifest_path and os.path.exists(split_manifest_path):
+        logger.info(f"Loading split manifest from {split_manifest_path}")
+        return load_split_manifest(split_manifest_path)
+
     train_val_ids, test_ids = train_test_split(
         dataframe['image_id'],
         test_size=test_size,
@@ -165,8 +236,22 @@ def get_random_splits(dataframe, test_size=0.2, val_size=0.1, random_state=42):
         random_state=random_state
     )
     
-    return {
+    splits = {
         'train': train_ids.tolist(),
         'val': val_ids.tolist(),
         'test': test_ids.tolist()
     }
+
+    if save_manifest_path:
+        save_split_manifest(
+            splits,
+            save_manifest_path,
+            metadata={
+                'strategy': 'multilabel_random',
+                'seed': random_state,
+                'test_size': test_size,
+                'val_size': val_size,
+            }
+        )
+
+    return splits

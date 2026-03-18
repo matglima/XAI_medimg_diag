@@ -19,7 +19,8 @@ except ImportError:
     print("Warning: 'peft' not found. Loading LoRA adapters will fail.")
 
 class HybridMoE(nn.Module):
-    def __init__(self, gate_config, expert_config, pathology_list, device):
+    def __init__(self, gate_config, expert_config, pathology_list, device,
+                 fusion_strategy='additive', top_k=1):
         """
         Initializes the MoE structure *without* weights.
         
@@ -32,6 +33,22 @@ class HybridMoE(nn.Module):
         super().__init__()
         self.pathology_list = pathology_list
         self.device = device
+        fusion_aliases = {
+            'additive': 'additive',
+            'sum': 'additive',
+            'scalar': 'scalar_calibration',
+            'scalar_calibration': 'scalar_calibration',
+            'soft': 'soft_gating',
+            'soft_gating': 'soft_gating',
+            'topk': 'topk',
+            'top_k': 'topk',
+        }
+        normalized_strategy = fusion_aliases.get(fusion_strategy.lower())
+        if normalized_strategy is None:
+            raise ValueError(f"Unknown fusion strategy: {fusion_strategy}")
+
+        self.fusion_strategy = normalized_strategy
+        self.top_k = int(top_k)
         
         # 1. Create the Gate model structure
         self.gate = create_model(
@@ -49,6 +66,12 @@ class HybridMoE(nn.Module):
                 pretrained=False # We will load weights
             ).to(device)
             self.experts.append(expert)
+
+        if self.fusion_strategy == 'scalar_calibration':
+            num_pathologies = len(self.pathology_list)
+            self.fusion_alpha = nn.Parameter(torch.ones(1, num_pathologies))
+            self.fusion_beta = nn.Parameter(torch.ones(1, num_pathologies))
+            self.fusion_bias = nn.Parameter(torch.zeros(1, num_pathologies))
 
     def load_checkpoints(self, gate_ckpt_path, expert_ckpt_dir, gate_is_lora, expert_is_lora):
         """
@@ -106,23 +129,62 @@ class HybridMoE(nn.Module):
         
         print("All checkpoints loaded successfully.")
 
-    def forward(self, x):
-        """
-        This forward pass is dense and non-sparse, designed for calibration.
-        It gets a general prediction from the gate and a specific prediction
-        from each expert, then combines them.
-        """
-        # 1. Gate provides a multi-label overview
-        gate_logits = self.gate(x) # Shape: [B, 14]
-        
-        # 2. Experts provide specialized binary predictions
+    def has_trainable_fusion_parameters(self):
+        return self.fusion_strategy == 'scalar_calibration'
+
+    def _collect_logits(self, x):
+        gate_logits = self.gate(x)
+
         expert_logits = []
         for expert in self.experts:
-            expert_logits.append(expert(x)) # Shape: [B, 1]
-            
-        expert_logits_tensor = torch.cat(expert_logits, dim=1) # Shape: [B, 14]
-        
-        # 3. Combine knowledge. Simple addition is a robust start.
-        final_logits = gate_logits + expert_logits_tensor
-        
+            expert_logits.append(expert(x))
+
+        expert_logits_tensor = torch.cat(expert_logits, dim=1)
+        return gate_logits, expert_logits_tensor
+
+    def _combine_logits(self, gate_logits, expert_logits_tensor):
+        if self.fusion_strategy == 'additive':
+            expert_weights = torch.ones_like(expert_logits_tensor)
+            final_logits = gate_logits + expert_logits_tensor
+        elif self.fusion_strategy == 'scalar_calibration':
+            expert_weights = self.fusion_beta.expand_as(expert_logits_tensor)
+            final_logits = (
+                self.fusion_alpha * gate_logits
+                + self.fusion_beta * expert_logits_tensor
+                + self.fusion_bias
+            )
+        elif self.fusion_strategy == 'soft_gating':
+            expert_weights = torch.sigmoid(gate_logits)
+            final_logits = gate_logits + (expert_weights * expert_logits_tensor)
+        elif self.fusion_strategy == 'topk':
+            gate_scores = torch.sigmoid(gate_logits)
+            if self.top_k <= 0 or self.top_k >= gate_scores.shape[1]:
+                expert_weights = torch.ones_like(gate_scores)
+            else:
+                top_k = min(self.top_k, gate_scores.shape[1])
+                topk_indices = torch.topk(gate_scores, k=top_k, dim=1).indices
+                expert_weights = torch.zeros_like(gate_scores)
+                expert_weights.scatter_(1, topk_indices, 1.0)
+            final_logits = gate_logits + (expert_weights * expert_logits_tensor)
+        else:  # pragma: no cover
+            raise RuntimeError(f"Unsupported fusion strategy: {self.fusion_strategy}")
+
+        return final_logits, expert_weights
+
+    def forward_with_components(self, x):
+        gate_logits, expert_logits_tensor = self._collect_logits(x)
+        final_logits, expert_weights = self._combine_logits(gate_logits, expert_logits_tensor)
+        return {
+            'gate_logits': gate_logits,
+            'expert_logits': expert_logits_tensor,
+            'expert_weights': expert_weights,
+            'final_logits': final_logits,
+        }
+
+    def forward(self, x):
+        """
+        Runs the dense Hybrid MoE and returns the fused logits.
+        """
+        outputs = self.forward_with_components(x)
+        final_logits = outputs['final_logits']
         return final_logits

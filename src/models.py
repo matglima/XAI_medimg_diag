@@ -163,6 +163,21 @@ class ModelWrapper(nn.Module):
 
     def _create_model(self, pretrained):
         """Create model with optional LoRA/Q-LoRA"""
+        logger.info(
+            "Creating backbone model_name=%s model_size=%s pretrained=%s use_lora=%s use_qlora=%s num_classes=%s",
+            self.model_name,
+            self.model_size,
+            pretrained,
+            self.use_lora,
+            self.use_qlora,
+            self.num_classes,
+        )
+        if pretrained:
+            logger.info(
+                "Loading torchvision pretrained weights for %s/%s. If this is the first run for this backbone, a weight download may occur.",
+                self.model_name,
+                self.model_size,
+            )
         
         weights = 'DEFAULT' if pretrained else None
         model_fn = self._get_model_fn()
@@ -180,9 +195,11 @@ class ModelWrapper(nn.Module):
 
         # Load base model
         model = model_fn(**model_kwargs)
+        logger.info("Backbone instantiated successfully for %s/%s", self.model_name, self.model_size)
         
         # Modify head BEFORE applying LoRA
         self._modify_head(model)
+        logger.info("Classifier head adapted for %s outputs", self.num_classes)
         
         if self.use_lora:
             # --- Dynamic LoRA Targeting ---

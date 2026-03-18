@@ -26,3 +26,5 @@ ENV/
 .vscode/
 
 src/.ipynb_checkpoints/*
+TODO.md
+data*

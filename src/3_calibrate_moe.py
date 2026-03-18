@@ -29,6 +29,7 @@ except ImportError:
     print("Warning: 'mlflow' package not found. MLflow logging will be disabled.")
 
 from dataloader import MultiLabelRetinaDataset, get_random_splits, train_transform, val_transform
+from experiment_utils import save_run_manifest, set_global_seed
 from moe_model import HybridMoE
 from models import get_optimizer
 from config import BRSET_LABELS
@@ -63,7 +64,14 @@ class CalibrationModule(pl.LightningModule):
 
         # --- 1. Initialize MoE Structure ---
         logger.info("Initializing HybridMoE structure...")
-        self.model = HybridMoE(gate_config, expert_config, self.PATHOLOGIES, 'cpu')
+        self.model = HybridMoE(
+            gate_config,
+            expert_config,
+            self.PATHOLOGIES,
+            'cpu',
+            fusion_strategy=self.hparams.fusion_strategy,
+            top_k=self.hparams.top_k,
+        )
         
         # --- CRITICAL CHANGE: NO LOADING HERE ---
         # We do not call load_checkpoints here to avoid the "Double Loading" crash 
@@ -78,12 +86,30 @@ class CalibrationModule(pl.LightningModule):
         Must be called AFTER load_checkpoints() injects LoRA adapters in main().
         """
         logger.info("Configuring trainable parameters (Freezing base, Unfreezing LoRA/Heads)...")
+        logger.info(
+            "Calibration mode: fusion_strategy=%s, fusion_only=%s",
+            self.hparams.fusion_strategy,
+            self.hparams.fusion_only,
+        )
         total_params, trainable_params = 0, 0
+
+        if self.hparams.fusion_only and not self.model.has_trainable_fusion_parameters():
+            raise ValueError(
+                f"fusion_only=True is incompatible with fusion strategy '{self.hparams.fusion_strategy}' because it has no trainable fusion parameters."
+            )
         
         for name, param in self.model.named_parameters():
             total_params += param.numel()
             # 1. Default: Freeze everything
             param.requires_grad = False
+
+            if name.startswith('fusion_'):
+                param.requires_grad = True
+                trainable_params += param.numel()
+                continue
+
+            if self.hparams.fusion_only:
+                continue
             
             # 2. Unfreeze logic: LoRA adapters, Classifiers/Heads
             # We match common names for heads/adapters
@@ -164,7 +190,13 @@ class CalibrationDataModule(pl.LightningDataModule):
         self.PATHOLOGIES = BRSET_LABELS
         self.labels_df = pd.read_csv(self.hparams.labels_path)
         self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
-        self.splits = get_random_splits(self.labels_df, test_size=0.2, val_size=0.1)
+        self.splits = get_random_splits(
+            self.labels_df,
+            test_size=0.2,
+            val_size=0.1,
+            random_state=self.hparams.seed,
+            split_manifest_path=self.hparams.split_manifest,
+        )
 
     def setup(self, stage=None):
         self.train_dataset = MultiLabelRetinaDataset(
@@ -177,24 +209,36 @@ class CalibrationDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
 # --- Main execution ---
 
 def main(args):
+    set_global_seed(args.seed)
+
     # --- 1. Init Data ---
     dm = CalibrationDataModule(args)
     
     # --- 2. Init Model ---
     model = CalibrationModule(args)
     os.makedirs(args.output_dir, exist_ok=True)
+    save_run_manifest(
+        args.output_dir,
+        "calibration_run_manifest.json",
+        args,
+        extra={'phase': 'calibration'},
+    )
 
     # --- 3. Manually Load Checkpoints HERE (Only for training start) ---
     logger.info("Loading pre-trained checkpoints into initialized model...")
@@ -264,7 +308,8 @@ def main(args):
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
         logger=mlflow_logger if args.use_mlflow else False,
-        callbacks=callbacks
+        callbacks=callbacks,
+        deterministic=True,
     )
     
     # --- 7. Run Training ---
@@ -343,10 +388,15 @@ if __name__ == "__main__":
     parser.add_argument('--expert-use-lora', action='store_true')
     parser.add_argument('--expert-use-qlora', action='store_true')
     parser.add_argument('--lora-r', type=int, default=16)
+    parser.add_argument('--fusion-strategy', type=str, default='additive')
+    parser.add_argument('--top-k', type=int, default=1)
+    parser.add_argument('--fusion-only', action='store_true')
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-6)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split-manifest', type=str, default=None)
     parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
     
     args = parser.parse_args()

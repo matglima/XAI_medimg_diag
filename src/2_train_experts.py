@@ -34,6 +34,7 @@ except ImportError:
     print("Warning: 'mlflow' package not found. MLflow logging will be disabled.")
 
 from dataloader import RetinaDataset, get_stratified_splits, train_transform, val_transform
+from experiment_utils import save_run_manifest, set_global_seed
 from models import create_model, get_optimizer
 
 # --- Configuration ---
@@ -182,7 +183,12 @@ class ExpertDataModule(pl.LightningDataModule):
         self.labels_df = self._load_and_clean_labels(self.hparams.labels_path, [self.hparams.target_label])
         
         self.labels_df['image_id'] = self.labels_df['image_id'].astype(str)
-        self.splits = get_stratified_splits(self.labels_df, self.hparams.target_label)
+        self.splits = get_stratified_splits(
+            self.labels_df,
+            self.hparams.target_label,
+            random_state=self.hparams.seed,
+            split_manifest_path=self.hparams.split_manifest,
+        )
 
     def _load_and_clean_labels(self, labels_path, pathology_columns):
         """Loads CSV and converts 'yes'/'no' labels to 1/0."""
@@ -218,28 +224,46 @@ class ExpertDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset, batch_size=self.hparams.batch_size, shuffle=False, 
-            num_workers=self.hparams.num_workers, pin_memory=True, persistent_workers=True
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
 # --- Main execution ---
 
 def main(args):
+    set_global_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger.info("Writing expert run manifest for '%s'...", args.target_label)
+    save_run_manifest(
+        args.output_dir,
+        f"expert_{args.target_label}_run_manifest.json",
+        args,
+        extra={'phase': 'expert', 'target_label': args.target_label},
+    )
+
     # --- 1. Init Data ---
+    logger.info("Initializing expert data module for '%s'...", args.target_label)
     dm = ExpertDataModule(args)
     
     # --- 2. Init Model ---
+    logger.info("Initializing expert model for '%s'...", args.target_label)
     model = ExpertModule(args)
     
     # --- 3. Init Loggers and Callbacks ---
@@ -292,7 +316,8 @@ def main(args):
         # strategy='fsdp',
         logger=mlflow_logger if args.use_mlflow else False,
         callbacks=callbacks,
-        log_every_n_steps=10
+        log_every_n_steps=10,
+        deterministic=True,
     )
     
     # --- 5. Run Training ---
@@ -360,6 +385,8 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split-manifest', type=str, default=None)
     parser.add_argument('--alpha', type=float, default=0.75)
     parser.add_argument('--gamma', type=float, default=2.0)
     parser.add_argument('--use-lora', action='store_true')

@@ -7,6 +7,7 @@ from datetime import datetime
 # If not, you may need to define BRSET_LABELS manually, e.g.:
 # BRSET_LABELS = ['DME', 'DR', 'ARMD', 'MH', 'DN', 'MYA', 'BRVO', 'TSLN', 'ERM', 'LS', 'MS', 'CSR', 'ODC', 'CRVO', 'TV', 'AH', 'ODP', 'ODE', 'ST', 'AION', 'PT', 'RT', 'RS', 'CRS', 'EDN', 'RPEC', 'MHL', 'RP', 'CWS', 'CB', 'ODPM', 'PRH', 'MRH', 'MNF', 'HR', 'CRAO', 'TD', 'CME', 'PTCA', 'BPR', 'OS', 'SCH', 'SD']
 from src.config import BRSET_LABELS
+from src.experiment_utils import save_run_manifest
 import pandas as pd
 ############################################# fix brset labels for diabetes ###########################
 # --- Settings ---
@@ -47,6 +48,8 @@ def parse_arguments(args_list=None):
                         default='data/fundus_photos', 
                         help="Path to the directory containing all images")
     parser.add_argument('--checkpoint-dir', type=str, default="checkpoints", help="Root directory to save all checkpoints")
+    parser.add_argument('--seed', type=int, default=42, help="Global seed used across all phases")
+    parser.add_argument('--split-manifest-path', type=str, default=None, help="Path to the shared split manifest")
     
     # --- MLflow Config ---
     parser.add_argument('--use-mlflow', action='store_true', help="Enable MLflow logging")
@@ -62,6 +65,10 @@ def parse_arguments(args_list=None):
     # --- LoRA Config (Global) ---
     parser.add_argument('--use-lora', action='store_true', help="Use LoRA for both Gate and Experts")
     parser.add_argument('--use-qlora', action='store_true', help="Use Q-LoRA for both Gate and Experts")
+    parser.add_argument('--gate-use-lora', action='store_true', help="Use LoRA for the Gate only")
+    parser.add_argument('--expert-use-lora', action='store_true', help="Use LoRA for the Experts only")
+    parser.add_argument('--gate-use-qlora', action='store_true', help="Use Q-LoRA for the Gate only")
+    parser.add_argument('--expert-use-qlora', action='store_true', help="Use Q-LoRA for the Experts only")
     parser.add_argument('--lora-r', type=int, default=128, help="LoRA rank")
     
     # --- Training Params (Global) ---
@@ -76,9 +83,20 @@ def parse_arguments(args_list=None):
     parser.add_argument('--calibrate-epochs', type=int, default=10, help="Epochs for MoE calibration")
     parser.add_argument('--calibrate-batch-size', type=int, default=4, help="Batch size for calibration")
     parser.add_argument('--calibrate-lr', type=float, default=1e-5, help="Learning rate for calibration")
+    parser.add_argument('--fusion-strategy', type=str, default='additive', help="Fusion strategy for the Hybrid MoE")
+    parser.add_argument('--top-k', type=int, default=1, help="Top-k value for sparse fusion")
+    parser.add_argument('--fusion-only', action='store_true', help="Train only fusion parameters during calibration")
 
     # --- Evaluation Params ---
     parser.add_argument('--eval-batch-size', type=int, default=64, help="Batch size for final evaluation")
+    parser.add_argument('--disable-threshold-tuning', action='store_true', help="Disable validation-based threshold tuning during evaluation")
+    parser.add_argument('--threshold-min', type=float, default=0.05, help="Minimum threshold value for tuning")
+    parser.add_argument('--threshold-max', type=float, default=0.95, help="Maximum threshold value for tuning")
+    parser.add_argument('--threshold-step', type=float, default=0.05, help="Threshold search step size")
+    parser.add_argument('--subgroup-columns', type=str, default=None, help="Comma-separated metadata columns for subgroup analysis")
+    parser.add_argument('--age-column', type=str, default=None, help="Metadata column to use for age-bin subgroup analysis")
+    parser.add_argument('--age-bins', type=str, default='0,45,65,200', help="Comma-separated age bin edges")
+    parser.add_argument('--min-subgroup-size', type=int, default=25, help="Minimum subgroup size to report")
 
     # --- System Params ---
     parser.add_argument('--num-workers', type=int, default=60, help="Number of dataloader workers")
@@ -88,10 +106,15 @@ def parse_arguments(args_list=None):
     args, _ = parser.parse_known_args(args_list)
     
     args.PATHOLOGIES = BRSET_LABELS
+    args.gate_use_lora = args.use_lora or args.gate_use_lora
+    args.expert_use_lora = args.use_lora or args.expert_use_lora
+    args.gate_use_qlora = args.use_qlora or args.gate_use_qlora
+    args.expert_use_qlora = args.use_qlora or args.expert_use_qlora
     args.GATE_CKPT_DIR = os.path.join(args.checkpoint_dir, 'gate')
     args.EXPERT_CKPT_DIR = os.path.join(args.checkpoint_dir, 'experts')
     args.FINAL_MOE_DIR = os.path.join(args.checkpoint_dir, 'final_moe')
     args.FINAL_MOE_PATH = os.path.join(args.FINAL_MOE_DIR, 'moe_calibrated_final.pth')
+    args.SPLIT_MANIFEST_PATH = args.split_manifest_path or os.path.join(args.checkpoint_dir, 'split_manifest.json')
 
     return args
 
@@ -135,7 +158,7 @@ def run_phase_0_build_cache(args, log_file):
     print("="*80)
     log_file.write("\n" + "="*80 + "\n--- PHASE 0: BUILDING IMAGE CACHE (if needed) ---\n" + "="*80 + "\n")
     cmd = [
-        'python', 'src/0_build_cache.py',
+        sys.executable, 'src/0_build_cache.py',
         '--labels-path', args.labels_path,
         '--image-dir', args.image_dir,
     ]
@@ -149,7 +172,7 @@ def run_phase_1_gate(args, log_file):
     log_file.write("\n" + "="*80 + "\n--- PHASE 1: TRAINING GATE MODEL ---\n" + "="*80 + "\n")
 
     cmd = [
-        'python', 'src/1_train_gate.py',
+        sys.executable, 'src/1_train_gate.py',
         '--labels-path', args.labels_path,
         '--image-dir', args.image_dir,
         '--output-dir', args.GATE_CKPT_DIR,
@@ -161,10 +184,13 @@ def run_phase_1_gate(args, log_file):
         '--lr', str(args.base_lr),
         '--patience', str(args.patience),
         '--num-workers', str(args.num_workers),
+        '--seed', str(args.seed),
+        '--split-manifest', args.SPLIT_MANIFEST_PATH,
+        '--save-split-manifest', args.SPLIT_MANIFEST_PATH,
         '--lora-r', str(args.lora_r),
     ]
-    if args.use_lora: cmd.append('--use-lora')
-    if args.use_qlora: cmd.append('--use-qlora')
+    if args.gate_use_lora: cmd.append('--use-lora')
+    if args.gate_use_qlora: cmd.append('--use-qlora')
     if args.use_mlflow: cmd.append('--use-mlflow') # <-- Pass MLflow flag
     run_command(cmd, log_file)
 
@@ -179,7 +205,7 @@ def run_phase_2_experts(args, log_file):
         print(f"\n--- Expert {i+1}/{len(args.PATHOLOGIES)}: {pathology} ---")
         log_file.write(f"\n--- Expert {i+1}/{len(args.PATHOLOGIES)}: {pathology} ---\n")
         cmd = [
-            'python', 'src/2_train_experts.py',
+            sys.executable, 'src/2_train_experts.py',
             '--labels-path', args.labels_path,
             '--image-dir', args.image_dir,
             '--target-label', pathology,
@@ -192,10 +218,12 @@ def run_phase_2_experts(args, log_file):
             '--lr', str(args.base_lr),
             '--patience', str(args.patience),
             '--num-workers', str(args.num_workers),
+            '--seed', str(args.seed),
+            '--split-manifest', args.SPLIT_MANIFEST_PATH,
             '--lora-r', str(args.lora_r),
         ]
-        if args.use_lora: cmd.append('--use-lora')
-        if args.use_qlora: cmd.append('--use-qlora')
+        if args.expert_use_lora: cmd.append('--use-lora')
+        if args.expert_use_qlora: cmd.append('--use-qlora')
         if args.use_mlflow: cmd.append('--use-mlflow') # <-- Pass MLflow flag
         run_command(cmd, log_file)
 
@@ -207,7 +235,7 @@ def run_phase_3_calibrate(args, log_file):
     log_file.write("\n" + "="*80 + "\n--- PHASE 3: CALIBRATING HYBRID MOE ---\n" + "="*80 + "\n")
 
     cmd = [
-        'python', 'src/3_calibrate_moe.py',
+        sys.executable, 'src/3_calibrate_moe.py',
         '--labels-path', args.labels_path,
         '--image-dir', args.image_dir,
         '--output-dir', args.FINAL_MOE_DIR,
@@ -223,13 +251,21 @@ def run_phase_3_calibrate(args, log_file):
         '--batch-size', str(args.calibrate_batch_size),
         '--lr', str(args.calibrate_lr),
         '--num-workers', str(args.num_workers),
+        '--seed', str(args.seed),
+        '--split-manifest', args.SPLIT_MANIFEST_PATH,
+        '--fusion-strategy', args.fusion_strategy,
+        '--top-k', str(args.top_k),
     ]
-    if args.use_lora:
+    if args.gate_use_lora:
         cmd.append('--gate-use-lora')
+    if args.expert_use_lora:
         cmd.append('--expert-use-lora')              
-    if args.use_qlora:
+    if args.gate_use_qlora:
         cmd.append('--gate-use-qlora')
+    if args.expert_use_qlora:
         cmd.append('--expert-use-qlora')
+    if args.fusion_only:
+        cmd.append('--fusion-only')
     if args.use_mlflow: cmd.append('--use-mlflow') # <-- Pass MLflow flag
     run_command(cmd, log_file)
 
@@ -241,7 +277,7 @@ def run_phase_4_evaluate(args, log_file):
     log_file.write("\n" + "="*80 + "\n--- PHASE 4: FINAL EVALUATION ---\n" + "="*80 + "\n")
 
     cmd = [
-        'python', 'src/evaluate.py',
+        sys.executable, 'src/evaluate.py',
         '--labels-path', args.labels_path,
         '--image-dir', args.image_dir,
         '--model-path', args.FINAL_MOE_PATH,
@@ -252,14 +288,31 @@ def run_phase_4_evaluate(args, log_file):
         '--expert-model-size', args.expert_model_size,
         '--batch-size', str(args.eval_batch_size),
         '--num-workers', str(args.num_workers),
+        '--seed', str(args.seed),
+        '--split-manifest', args.SPLIT_MANIFEST_PATH,
+        '--fusion-strategy', args.fusion_strategy,
+        '--top-k', str(args.top_k),
+        '--threshold-min', str(args.threshold_min),
+        '--threshold-max', str(args.threshold_max),
+        '--threshold-step', str(args.threshold_step),
+        '--age-bins', args.age_bins,
+        '--min-subgroup-size', str(args.min_subgroup_size),
         '--lora-r', str(args.lora_r),
     ]
-    if args.use_lora:
+    if args.gate_use_lora:
         cmd.append('--gate-use-lora')
+    if args.expert_use_lora:
         cmd.append('--expert-use-lora')
-    if args.use_qlora:
+    if args.gate_use_qlora:
         cmd.append('--gate-use-qlora')
+    if args.expert_use_qlora:
         cmd.append('--expert-use-qlora')
+    if args.disable_threshold_tuning:
+        cmd.append('--disable-threshold-tuning')
+    if args.subgroup_columns:
+        cmd.extend(['--subgroup-columns', args.subgroup_columns])
+    if args.age_column:
+        cmd.extend(['--age-column', args.age_column])
     if args.use_mlflow: cmd.append('--use-mlflow') # <-- Pass MLflow flag
     run_command(cmd, log_file)
 
@@ -273,6 +326,8 @@ def main(args_list=None):
     args = parse_arguments(args_list)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_filename = f"pipeline_log_{timestamp}.txt"
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    save_run_manifest(args.checkpoint_dir, f"pipeline_run_manifest_{timestamp}.json", args, extra={'timestamp': timestamp})
     print(f"Starting full pipeline. Log will be saved to: {log_filename}")
     print(f"Using {len(args.PATHOLOGIES)} pathologies: {args.PATHOLOGIES}")
 
